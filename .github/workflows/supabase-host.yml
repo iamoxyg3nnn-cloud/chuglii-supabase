@@ -1,0 +1,1840 @@
+# =============================================================================
+#  Full Supabase Self-Hosted on GitHub Actions
+# =============================================================================
+# What this does:
+# 1. Starts ALL Supabase services (full stack with Storage, Realtime, etc.)
+# 2. Restores your database from GitHub Actions cache (so data persists)
+# 2b. Snapshots the FULL state every 5 minutes during the session (on-disk),
+#     persisted to the Actions cache at shutdown. NOTE: GitHub no longer
+#     exposes the cache-service env vars to run: steps, so per-snapshot cache
+#     uploads from the keepalive loop are impossible  persistence relies on
+#     the end-of-run actions/cache save (which runs from the action runtime).
+# 3. Exposes everything via Cloudflare Tunnel
+# 4. Runs for ~5h30m per session (maximizing the full 6-hour GitHub Actions limit)
+# 5. 24/7 chaining: each session dispatches its successor after completion.
+#    The hourly schedule is a fallback if self-dispatch fails or a run is
+#    terminated before reaching the handoff.
+#
+# Required GitHub configuration:
+#   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
+#   CF_TUNNEL_DOMAIN    - Actions variable for your public domain (e.g. supabase.chuglii.in)
+#   POSTGRES_PASSWORD   - Your secure PostgreSQL password
+#   JWT_SECRET          - JWT signing secret (32+ chars)
+#   DASHBOARD_PASSWORD  - Supabase Studio admin password
+#   REDIS_DASHBOARD_PASSWORD - Redis Commander dashboard password
+#
+# Optional SMTP secrets (REAL auth emails  confirmation / reset / OTP actually
+# reach users instead of the dev-only inbucket fake SMTP). Leave unset to keep
+# inbucket. Any SMTP provider works (Resend, SendGrid, SES, Brevo, ...):
+#   SMTP_HOST          e.g. smtp.resend.com
+#   SMTP_PORT          e.g. 587
+#   SMTP_USER          e.g. resend
+#   SMTP_PASS          the provider's SMTP password / API key
+#   SMTP_ADMIN_EMAIL   verified From address (must be allowed by the provider)
+#   SMTP_SENDER_NAME   display name shown as the sender
+#
+# Optional off-site backup secret (Cloudflare KV disaster-recovery mirror):
+#   CLOUDFLARE_BACKUP_TOKEN - a permanent Cloudflare API token ("Workers KV
+#                             Storage: Edit") OR an OAuth refresh token from
+#                             `wrangler login` (starts with 'cfor'; single-use 
+#                             the runner keeps the rotated token in .env for
+#                             continuity). Without it, state persists only via
+#                             the Actions cache + runner-local archive.
+# =============================================================================
+#
+# Repository: https://github.com/iamoxyg3nnn-cloud/chuglii-supabase
+# The secrets listed above are configured on that repository (Settings → Secrets
+# and variables → Actions); CF_TUNNEL_DOMAIN should be an Actions variable.
+# =============================================================================
+
+name:  Full Supabase Self-Hosted
+run-name:  Full Supabase Self-Hosted${{ github.event.inputs.triggered_by == 'self-chain' && ' (chain)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'Source of the trigger (self-chain handoff)'
+        required: false
+        default: ''
+concurrency:
+  group: supabase-host
+  # NO cancel-in-progress: a new run (schedule or self-chain) QUEUES behind the
+  # active session and starts only after it ends. Never kills a live session.
+  cancel-in-progress: false
+
+env:
+  SUPABASE_DIR: ./supabase
+  # Full-state archive: DB dump + edge functions + snippets + pgsodium key
+  BACKUP_FILE: ./supabase/supabase-state.tar.gz
+  COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml:docker-compose.redis.yml
+  DOCKER_SOCKET_LOCATION: /var/run/docker.sock
+
+jobs:
+  supabase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355                  # 5h55m  5 min buffer under 360 min hard limit
+    permissions:
+      contents: write                     # checkout + GitHub Release rolling backup
+      actions: write                      # prune stale state-snapshot cache entries
+
+    steps:
+      #  Checkout 
+      - name:  Checkout repo
+        uses: actions/checkout@v7
+
+      # ── Expose Actions Runtime for mid-job cache saves ──────────────────
+      - name: 🔑 Expose GitHub Actions cache runtime credentials
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_RUNTIME_TOKEN) {
+              core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+            }
+            if (process.env.ACTIONS_RESULTS_URL) {
+              core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL);
+              core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'true');
+            }
+            core.info('GitHub Actions cache runtime credentials exported to job environment (Cache Service v2)');
+
+      #  Restore caches 
+      # NOTE: Docker images are NOT cached anymore  they pull fresh each run
+      # (~2 min, in parallel with setup), which keeps the GitHub cache tiny.
+      # Only the full-state archive (DB + functions + snippets + vault key)
+      # lives in the cache.
+
+      # Full-state archive cache (separate key with fallback for cross-run persistence)
+      # Restores the most recent 'supabase-db-live-*' entry (written by the
+      # end-of-run cache save), falling back to legacy 'supabase-db-*' keys.
+      - name:  Restore state cache
+        id: cache-db
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.BACKUP_FILE }}
+          key: supabase-db-live-${{ github.run_id }}
+          restore-keys: |
+            supabase-db-live-
+            supabase-db-
+          fail-on-cache-miss: false
+
+      #  Parallel prep + startup (everything runs at once) 
+      - name:  Super-fast startup
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Optional real SMTP for auth emails (falls back to inbucket if unset)
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_ADMIN_EMAIL: ${{ secrets.SMTP_ADMIN_EMAIL }}
+          SMTP_SENDER_NAME: ${{ secrets.SMTP_SENDER_NAME }}
+          # Optional OAuth providers (auto-enabled when the client ID secret is set)
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_SECRET: ${{ secrets.GOOGLE_SECRET }}
+          GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID }}
+          GITHUB_SECRET: ${{ secrets.GITHUB_SECRET }}
+        run: |
+          cd "$SUPABASE_DIR"
+          if [ -z "$CF_TUNNEL_TOKEN" ]; then
+            echo "::error::CF_TUNNEL_TOKEN is required to start the public Cloudflare tunnel"
+            exit 1
+          fi
+          if [ -z "$CF_TUNNEL_DOMAIN" ]; then
+            echo "::error::CF_TUNNEL_DOMAIN is required to publish a permanent public Redis HTTPS endpoint"
+            exit 1
+          fi
+          
+          # 
+          # PHASE 1: Prepare dependencies (parallel background jobs)
+          # 
+          (
+            # Download cloudflared for the public Supabase tunnel.
+            curl -sL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o /usr/local/bin/cloudflared &&
+            chmod +x /usr/local/bin/cloudflared &&
+            cloudflared version
+          ) &
+          pip install 'ecdsa>=0.19.0' -q &
+          (npm install --prefix utils --no-save @actions/cache@^4.0.0 @actions/core@^1.10.1 -q) &
+          (mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs,redis/data,inbucket/data} && chmod -R 777 volumes/redis/data) &
+          
+          # Pull Docker images in the background (runs in parallel with setup).
+          # No image cache anymore  images are re-pullable and pull quickly.
+          echo " Pulling Docker images in background..."
+          docker compose pull 2>&1 | tail -3 &
+
+          wait
+
+          # Guard: the compose file declares db-config as external: true, so docker
+          # compose up will hard-fail if a Docker volume named exactly "db-config"
+          # does not exist on the runner (fresh runner or after a cache miss).
+          docker volume create db-config >/dev/null 2>&1 || true
+          
+          # 
+          # PHASE 2: Configure .env (fast  ~3s)
+          # 
+          cp .env.example .env
+          CF_DOMAIN="$CF_TUNNEL_DOMAIN"
+          export PUBLIC_URL="https://$CF_DOMAIN"
+          python3 << 'PYEOF'
+          import os, hmac, hashlib, base64, json, re, uuid
+          from ecdsa import SigningKey, NIST256p
+          from ecdsa.util import sigencode_string
+
+          secret = os.environ['JWT_SECRET']
+          public_url = os.environ['PUBLIC_URL']
+
+          def derive_hex(name, num_bytes):
+              return hmac.new(secret.encode(), name.encode(), hashlib.sha512).hexdigest()[:num_bytes * 2]
+          def derive_b64(name, length):
+              return base64.urlsafe_b64encode(
+                  hmac.new(secret.encode(), name.encode(), hashlib.sha512).digest()).decode()[:length]
+          def validate_api_key(name, value, expected_role):
+              if not value:
+                  return
+              try:
+                  header, payload, signature = value.split('.')
+                  decoded_header = json.loads(base64.urlsafe_b64decode(header + '=' * (-len(header) % 4)))
+                  decoded_payload = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+                  base64.urlsafe_b64decode(signature + '=' * (-len(signature) % 4))
+              except (ValueError, json.JSONDecodeError):
+                  raise SystemExit(f'{name} must be a three-part JWT')
+              if decoded_header.get('alg') != 'HS256' or decoded_payload.get('role') != expected_role:
+                  raise SystemExit(f'{name} must be an HS256 JWT with role {expected_role}')
+              if not re.fullmatch(r'[A-Za-z0-9_-]+', header) or not re.fullmatch(r'[A-Za-z0-9_-]+', payload) or not re.fullmatch(r'[A-Za-z0-9_-]+', signature):
+                  raise SystemExit(f'{name} contains unsupported characters')
+          def b64url(d):
+              return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
+          def sign_hs256(payload_dict, secret):
+              header = json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
+              payload = json.dumps(payload_dict).encode()
+              b64_h = b64url(header)
+              b64_p = b64url(payload)
+              sig = hmac.new(secret.encode(), f"{b64_h}.{b64_p}".encode(), hashlib.sha256).digest()
+              return f"{b64_h}.{b64_p}.{b64url(sig)}"
+          def sign_es256(payload_dict, sk, kid):
+              header = json.dumps({"alg": "ES256", "typ": "JWT", "kid": kid}).encode()
+              payload = json.dumps(payload_dict).encode()
+              b64_h = b64url(header)
+              b64_p = b64url(payload)
+              sig = sk.sign(f"{b64_h}.{b64_p}".encode(), hashfunc=hashlib.sha256, sigencode=sigencode_string)
+              return f"{b64_h}.{b64_p}.{b64url(sig)}"
+
+          iat = 1700000000
+          exp = iat + 315360000
+          anon_key = sign_hs256({'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
+          service_key = sign_hs256({'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
+          api_key = os.environ.get('SUPABASE_API_KEY', '')
+          service_role_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
+          validate_api_key('SUPABASE_API_KEY', api_key, 'anon')
+          validate_api_key('SUPABASE_SERVICE_ROLE_KEY', service_role_key, 'service_role')
+
+          skb = derive_b64('secret_key_base', 64)
+          rek = derive_hex('realtime_enc_key', 8)
+          vek = derive_hex('vault_enc_key', 16)
+          pmk = derive_b64('pg_meta_crypto_key', 32)
+          ptid = derive_hex('pooler_tenant_id', 8)
+          # s3 keys no longer needed  storage service removed
+          lfp = derive_b64('logflare_public', 32)
+          lpv = derive_b64('logflare_private', 32)
+          redis_pass = os.environ.get('REDIS_PASSWORD') or derive_hex('redis_password', 16)
+
+          # Generate ES256 P-256 key pair deterministically from JWT_SECRET
+          ec_seed = hmac.new(secret.encode(), b'asymmetric_es256', hashlib.sha512).digest()[:32]
+          sk_ec = SigningKey.from_string(ec_seed, curve=NIST256p)
+          vk = sk_ec.verifying_key
+          pub_point = vk.pubkey.point
+          jwk_x = b64url(pub_point.x().to_bytes(32, 'big'))
+          jwk_y = b64url(pub_point.y().to_bytes(32, 'big'))
+          jwk_d = b64url(sk_ec.privkey.secret_multiplier.to_bytes(32, 'big'))
+          jwk_k = b64url(secret.encode())
+          kid = str(uuid.UUID(bytes=hmac.new(secret.encode(), b'jwks_kid', hashlib.sha512).digest()[:16]))
+          jwt_keys = json.dumps([{"kty":"EC","kid":kid,"use":"sig","key_ops":["sign","verify"],"alg":"ES256","ext":True,"crv":"P-256","x":jwk_x,"y":jwk_y,"d":jwk_d},{"kty":"oct","alg":"HS256","k":jwk_k,"kid":"legacy-hs256"}])
+          jwt_jwks = json.dumps({"keys":[{"kty":"EC","kid":kid,"use":"sig","key_ops":["verify"],"alg":"ES256","ext":True,"crv":"P-256","x":jwk_x,"y":jwk_y},{"kty":"oct","alg":"HS256","k":jwk_k,"kid":"legacy-hs256"}]})
+          anon_asymmetric = sign_es256({'role':'anon','iss':'supabase','iat':iat,'exp':exp}, sk_ec, kid)
+          service_asymmetric = sign_es256({'role':'service_role','iss':'supabase','iat':iat,'exp':exp}, sk_ec, kid)
+          def mk_opaque(p):
+              r = b64url(hmac.new(secret.encode(),f'opaque_{p}'.encode(),hashlib.sha512).digest()[:17])[:22]
+              c = b64url(hmac.new(f'supabase-self-hosted|{p}{r}'.encode(),b'checksum',hashlib.sha256).digest()[:6])[:8]
+              return f'{p}{r}_{c}'
+          pub_k, sec_k = mk_opaque('sb_publishable_'), mk_opaque('sb_secret_')
+
+          with open('.env') as f: env_content = f.read()
+          reps = {
+            'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
+            'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
+            'this_password_is_insecure_and_should_be_updated': os.environ['DASHBOARD_PASSWORD'],
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJhbm9uIiwKICAgICJpc3MiOiAic3VwYWJhc2UtZGVtbyIsCiAgICAiaWF0IjogMTY0MTc2OTIwMCwKICAgICJleHAiOiAxNzk5NTM1NjAwCn0.dc_X5iR_VP_qT0zsiyj_I_OZ2T9FtRU2BBNWN8Bu4GE': anon_key,
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJzZXJ2aWNlX3JvbGUiLAogICAgImlzcyI6ICJzdXBhYmFzZS1kZW1vIiwKICAgICJpYXQiOiAxNjQxNzY5MjAwLAogICAgImV4cCI6IDE3OTk1MzU2MDAKfQ.DaYlNEoUrrEn2Ig7tqibS-PHK5vgusbcbo7X36XVt4Q': service_key,
+            'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': skb,
+            'http://localhost:8000': public_url,
+            'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
+            'ADDITIONAL_REDIRECT_URLS=': f'ADDITIONAL_REDIRECT_URLS={public_url}',
+            'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={rek}',
+            'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vek}',
+            'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pmk}',
+            'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={ptid}',
+            # S3_PROTOCOL_ACCESS_KEY_ID/SECRET removed  storage service removed
+            'your-super-secret-and-long-logflare-key-public': lfp,
+            'your-super-secret-and-long-logflare-key-private': lpv,
+            'SUPABASE_PUBLISHABLE_KEY=': f'SUPABASE_PUBLISHABLE_KEY={pub_k}',
+            'SUPABASE_SECRET_KEY=': f'SUPABASE_SECRET_KEY={sec_k}',
+            'JWT_KEYS=': f'JWT_KEYS={jwt_keys}',
+            'JWT_JWKS=': f'JWT_JWKS={jwt_jwks}',
+            'ANON_KEY_ASYMMETRIC=': f'ANON_KEY_ASYMMETRIC={anon_asymmetric}',
+            'SERVICE_ROLE_KEY_ASYMMETRIC=': f'SERVICE_ROLE_KEY_ASYMMETRIC={service_asymmetric}',
+            'your-redis-password': redis_pass,
+          }
+          # Real SMTP (optional)  replaces the fake inbucket defaults so auth
+          # confirmation/reset emails actually deliver. Leave SMTP_HOST unset
+          # to keep inbucket (dev-only fake SMTP).
+          if os.environ.get('SMTP_HOST'):
+              reps.update({
+                  'SMTP_ADMIN_EMAIL=admin@example.com': f'SMTP_ADMIN_EMAIL={os.environ.get("SMTP_ADMIN_EMAIL", "admin@example.com")}',
+                  'SMTP_HOST=supabase-mail': f'SMTP_HOST={os.environ["SMTP_HOST"]}',
+                  'SMTP_PORT=2500': f'SMTP_PORT={os.environ.get("SMTP_PORT", "587")}',
+                  'SMTP_USER=fake_mail_user': f'SMTP_USER={os.environ.get("SMTP_USER", "resend")}',
+                  'SMTP_PASS=fake_mail_password': f'SMTP_PASS={os.environ.get("SMTP_PASS", "")}',
+                  'SMTP_SENDER_NAME=fake_sender': f'SMTP_SENDER_NAME={os.environ.get("SMTP_SENDER_NAME", "Supabase")}',
+              })
+              print("SMTP: real provider configured")
+          else:
+              # No real SMTP  enable autoconfirm so signup/password-reset
+              # work without needing a reachable mail server.
+              reps['ENABLE_EMAIL_AUTOCONFIRM=false'] = 'ENABLE_EMAIL_AUTOCONFIRM=true'
+              print("SMTP: SMTP_HOST not set  enabling autoconfirm (no email verification required)")
+          # OAuth providers (optional): enabling is driven purely by the client-ID
+          # secret being set. Redirect URI is API_EXTERNAL_URL/callback (the
+          # public URL), already handled by the compose file.
+          for prov in ('GOOGLE', 'GITHUB'):
+              if os.environ.get(f'{prov}_CLIENT_ID'):
+                  reps[f'{prov}_ENABLED=false'] = f'{prov}_ENABLED=true'
+                  reps[f'{prov}_CLIENT_ID='] = f'{prov}_CLIENT_ID={os.environ[f"{prov}_CLIENT_ID"]}'
+                  reps[f'{prov}_SECRET='] = f'{prov}_SECRET={os.environ[f"{prov}_SECRET"]}'
+                  print(f'OAuth: {prov} enabled')
+          missing = []
+          for old, new in reps.items():
+              if old in env_content:
+                  env_content = env_content.replace(old, new)
+              else:
+                  missing.append(old[:40])
+          if missing:
+              print(f"WARNING: {len(missing)} placeholder(s) not found:")
+              for m in missing: print(f"  - {m}...")
+          else:
+              print(f"All {len(reps)} replacements applied")
+          with open('.env','w') as f: f.write(env_content)
+          with open('.env','a') as f:
+              if api_key:
+                  f.write(f'SUPABASE_API_KEY={api_key}\n')
+              if service_role_key:
+                  f.write(f'SUPABASE_SERVICE_ROLE_KEY={service_role_key}\n')
+              if os.environ.get('OPENAI_API_KEY'):
+                  f.write(f'OPENAI_API_KEY={os.environ["OPENAI_API_KEY"]}\n')
+          print(".env configured")
+          PYEOF
+
+      #  Wire off-site backup creds (Cloudflare KV) into .env 
+      # The keepalive loop pushes every state archive to Workers KV after each
+      # snapshot (see snapshot-state.sh); the restore step below pulls it back
+      # if the local/cache archive is ever lost. ACCOUNT/NAMESPACE/API_TOKEN
+      # are rewritten EVERY run so a token added/changed in secrets always takes
+      # effect.
+      #
+      # Why .cf-creds: Cloudflare 'cfor*' refresh tokens are single-use and
+      # rotate on every mint. The old design kept the rotated token in .env —
+      # but 'Super-fast startup' recreates .env from .env.example EVERY run and
+      # .env is not archived, so after the FIRST session the secret's token was
+      # already consumed, there was no rotated token to fall back to, and every
+      # later session logged "Cloudflare backup NOT configured"  off-site KV
+      # backups silently never ran. The rotated refresh token now lives in
+      # .cf-creds, which IS part of the state archive (snapshot-state.sh), so
+      # the OAuth chain survives restarts and even cancelled sessions.
+      #
+      # CLOUDFLARE_BACKUP_TOKEN can be either:
+      #   * a permanent account API token (dashboard, scoped to "Workers KV
+      #     Storage: Edit")  used as-is; the robust option (survives fresh
+      #     runners too), or
+      #   * an OAuth refresh token starting with "cfor" (from `wrangler login`)
+      #      minted once for the first session; continuity thereafter relies on
+      #     the rotated token persisted in .cf-creds.
+      - name:  Wire Cloudflare backup creds
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
+          CF_BACKUP_ACCOUNT_ID: ${{ vars.CF_BACKUP_ACCOUNT_ID || secrets.CF_BACKUP_ACCOUNT_ID }}
+          CF_BACKUP_KV_NAMESPACE_ID: ${{ vars.CF_BACKUP_KV_NAMESPACE_ID || secrets.CF_BACKUP_KV_NAMESPACE_ID }}
+        run: |
+          cd "$SUPABASE_DIR"
+          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN|REFRESH_TOKEN)=/d' .env 2>/dev/null || true
+
+          if [ -n "${CF_BACKUP_ACCOUNT_ID}" ] && [ -n "${CF_BACKUP_KV_NAMESPACE_ID}" ]; then
+            {
+              echo "CF_ACCOUNT_ID=${CF_BACKUP_ACCOUNT_ID}"
+              echo "CF_KV_NAMESPACE_ID=${CF_BACKUP_KV_NAMESPACE_ID}"
+            } >> .env
+            echo "  Cloudflare KV backup target configured (namespace ${CF_BACKUP_KV_NAMESPACE_ID})"
+          else
+            echo "  ::warning::CF_BACKUP_ACCOUNT_ID / CF_BACKUP_KV_NAMESPACE_ID not configured — off-site KV backup will be skipped"
+          fi
+
+          # (The archived rotated refresh token is loaded further down, only
+          # when it is actually needed  avoids a second CF_REFRESH_TOKEN line
+          # shadowing a freshly minted one.)
+
+          if [ -n "${CF_API_TOKEN}" ]; then
+            case "${CF_API_TOKEN}" in
+              cfor*)
+                RESP=$(curl -sS --max-time 20 -X POST "https://dash.cloudflare.com/oauth2/token" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  --data "grant_type=refresh_token&refresh_token=${CF_API_TOKEN}&client_id=54d11594-84e4-41aa-b438-e81b8fa78ee7")
+                AT=$(printf '%s' "$RESP" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+                RT=$(printf '%s' "$RESP" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')
+                if [ -n "$AT" ]; then
+                  echo "CF_API_TOKEN=${AT}" >> .env
+                  [ -n "$RT" ] && echo "CF_REFRESH_TOKEN=${RT}" >> .env
+                  echo "  Cloudflare creds minted from OAuth refresh token (chain continues via rotated token)"
+                else
+                  echo "  Secret refresh token already consumed  falling back to the archived .cf-creds token..."
+                fi
+                ;;
+              *)
+                echo "CF_API_TOKEN=${CF_API_TOKEN}" >> .env
+                echo "  Cloudflare permanent API token configured"
+                ;;
+            esac
+          else
+            echo "  Cloudflare secret not set  relying on the archived .cf-creds token (if any)"
+          fi
+
+          # Continuity: if no access token could be minted from the secret,
+          # renew one from a rotated refresh token  first whatever survived in
+          # .env, otherwise the ARCHIVED .cf-creds fallback (state archive ->
+          # restored by the step below). This is what keeps the single-use
+          # cfor* chain alive across sessions. cloudflare-backup.sh refresh
+          # re-persists the newly rotated token into .cf-creds as well.
+          if ! grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+            if ! grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null && [ -f ./.cf-creds ] \
+               && grep -q '^CF_REFRESH_TOKEN=.' ./.cf-creds 2>/dev/null; then
+              grep -E '^CF_REFRESH_TOKEN=' ./.cf-creds | head -1 >> .env
+              echo "  Cloudflare rotated refresh token restored from .cf-creds (state archive)"
+            fi
+            if grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null; then
+              bash utils/cloudflare-backup.sh refresh || true
+            fi
+          fi
+
+          # Persist whatever refresh token we ended up with for the next session.
+          # Only overwrite .cf-creds when a real token exists — never clobber a
+          # working archived token with an empty file when minting fails.
+          if grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null; then
+            grep -E '^CF_REFRESH_TOKEN=' .env | head -1 > ./.cf-creds \
+              && chmod 600 ./.cf-creds 2>/dev/null || true
+          fi
+
+          if ! grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+            echo "::warning::Cloudflare backup NOT configured  set a permanent Workers-KV Edit API token as the CLOUDFLARE_BACKUP_TOKEN secret"
+          else
+            bash utils/cloudflare-backup.sh list 2>/dev/null | head -3 || true
+            echo "  Cloudflare backup ready (off-site mirror + disaster-recovery restore)"
+          fi
+
+      - name: 🌐 Wire Hugging Face & Discord backup creds
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+          [ -n "$HF_TOKEN" ] && echo "HF_TOKEN=$HF_TOKEN" >> .env
+          [ -n "$HF_REPO" ] && echo "HF_REPO=$HF_REPO" >> .env
+          [ -n "$DISCORD_BACKUP_WEBHOOK" ] && echo "DISCORD_BACKUP_WEBHOOK=$DISCORD_BACKUP_WEBHOOK" >> .env
+          [ -n "$HF_TOKEN" ] && echo "  🤗 Hugging Face backup enabled ($HF_REPO)"
+          [ -n "$DISCORD_BACKUP_WEBHOOK" ] && echo "  💬 Discord backup enabled"
+          true
+
+      # Restore all database and runtime state before starting application services.
+      - name: Restore full state (databases, Redis, mail, functions, settings)
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          REDIS_DASHBOARD_PASSWORD: ${{ secrets.REDIS_DASHBOARD_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+
+          extract_state_archive() {
+            local archive="$1"
+            local members_file member
+            members_file=$(mktemp)
+            if ! tar tzf "$archive" >/dev/null 2>&1; then
+              rm -f "$members_file"
+              return 1
+            fi
+            if tar -tvzf "$archive" 2>/dev/null \
+              | awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { found = 1 } END { exit !found }'; then
+              rm -f "$members_file"
+              return 1
+            fi
+            while IFS= read -r member; do
+              case "$member" in
+                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|postgresql.auto.conf|./postgresql.auto.conf|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|appendonlydir/appendonly.aof.manifest|./appendonlydir/appendonly.aof.manifest|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/inbucket/data|./volumes/inbucket/data|volumes/inbucket/data/|./volumes/inbucket/data/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|db-backups|./db-backups|db-backups/|./db-backups/|db-backups/globals.sql|./db-backups/globals.sql|db-backups/manifest.tsv|./db-backups/manifest.tsv|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|.state-settings.env|./.state-settings.env|.cf-creds|./.cf-creds|state-ts|./state-ts)
+                  case "$member" in
+                    */) ;;
+                    *) printf '%s\n' "$member" >> "$members_file" ;;
+                  esac
+                  ;;
+                volumes/functions/*|./volumes/functions/*|volumes/snippets/*|./volumes/snippets/*|volumes/inbucket/data/*|./volumes/inbucket/data/*)
+                  archive_member="${member#./}"
+                  case "$archive_member" in */) archive_member="${archive_member%/}" ;; esac
+                  case "$archive_member" in
+                    /*|*\\*) rm -f "$members_file"; return 1 ;;
+                  esac
+                  IFS='/' read -r -a path_parts <<< "$archive_member"
+                  for path_part in "${path_parts[@]}"; do
+                    case "$path_part" in
+                      ""|"."|"..") rm -f "$members_file"; return 1 ;;
+                    esac
+                  done
+                  case "$member" in
+                    */) ;;
+                    *) printf '%s\n' "$member" >> "$members_file" ;;
+                  esac
+                  ;;
+                appendonlydir/*|./appendonlydir/*)
+                  redis_member="${member#./}"
+                  redis_member="${redis_member#appendonlydir/}"
+                  if printf '%s\n' "$redis_member" | grep -Eq '^appendonly\.aof\.[0-9]+\.(base\.rdb|incr\.aof)$'; then
+                    printf '%s\n' "$member" >> "$members_file"
+                  else
+                    rm -f "$members_file"
+                    return 1
+                  fi
+                  ;;
+              esac
+            done < <(tar tzf "$archive" 2>/dev/null)
+            if [ ! -s "$members_file" ] || ! tar xzf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
+              rm -f "$members_file"
+              return 1
+            fi
+            rm -f "$members_file"
+          }
+
+          # Multi-source disaster recovery: check GitHub Release, Cloudflare KV, and Actions Cache
+          if [ ! -f ./supabase-state.tar.gz ] && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+            echo "  ℹ️ No cached state archive on disk — checking GitHub Release (live-backup)..."
+            if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.gz" -O ./supabase-state.tar.gz 2>/dev/null && [ -s ./supabase-state.tar.gz ]; then
+              echo "  ✅ Adopted state archive from GitHub Release!"
+            fi
+          fi
+
+          if [ ! -f ./supabase-state.tar.gz ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+            echo "  No state archive on disk  attempting Cloudflare restore..."
+            if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz 2>/dev/null && [ -s ./supabase-state.tar.gz ]; then
+              echo "  ✅ Adopted state archive from Cloudflare KV"
+            fi
+          fi
+
+          if [ ! -f ./supabase-state.tar.gz ] && [ "${GITHUB_RUN_NUMBER:-0}" -gt 1 ]; then
+            echo "::error::no cached or off-site state archive exists after the first workflow run; refusing to create an empty replacement database"
+            exit 1
+          fi
+
+          if [ -f ./supabase-state.tar.gz ]; then
+            echo " State archive found  restoring databases, roles, Redis, functions, snippets, settings, and pgsodium key..."
+
+            LOCAL_TS="$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+            LOCAL_TS="${LOCAL_TS:-0}"
+
+            GH_TS=0
+            if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+              if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.gz" -O ./supabase-state.tar.gz.gh 2>/dev/null && [ -s ./supabase-state.tar.gz.gh ]; then
+                GH_TS="$(tar xzf ./supabase-state.tar.gz.gh -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+                GH_TS="${GH_TS:-0}"
+              fi
+            fi
+
+            KV_TS="$(bash utils/cloudflare-backup.sh manifest 2>/dev/null | tr -dc '0-9' | head -1 || echo 0)"
+            KV_TS="${KV_TS:-0}"
+
+            echo "  🔍 Available backups: Cache ts=$LOCAL_TS | GitHub Release ts=$GH_TS | Cloudflare KV ts=$KV_TS"
+
+            if [ "$GH_TS" -gt "$LOCAL_TS" ] && [ "$GH_TS" -ge "$KV_TS" ]; then
+              echo "  📦 GitHub Release backup is the freshest ($GH_TS > $LOCAL_TS) — adopting it"
+              mv -f ./supabase-state.tar.gz.gh ./supabase-state.tar.gz
+            elif [ "$KV_TS" -gt "$LOCAL_TS" ] && [ "$KV_TS" -gt "$GH_TS" ]; then
+              echo "  ☁️ Cloudflare KV backup is the freshest ($KV_TS > $LOCAL_TS) — adopting it"
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.kv 2>/dev/null && [ -s ./supabase-state.tar.gz.kv ]; then
+                mv -f ./supabase-state.tar.gz.kv ./supabase-state.tar.gz
+              fi
+            else
+              echo "  💾 Using Actions Cache backup ($LOCAL_TS)"
+            fi
+            rm -f ./supabase-state.tar.gz.gh ./supabase-state.tar.gz.kv
+
+            # Extraction must NOT fail silently: continuing without the archive
+            # can leave the stack running on an incomplete state.
+            if ! extract_state_archive ./supabase-state.tar.gz; then
+              echo "::warning::cached state archive is unreadable or unsupported — attempting off-site recovery"
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.offsite \
+                 && [ -s ./supabase-state.tar.gz.offsite ] \
+                 && extract_state_archive ./supabase-state.tar.gz.offsite; then
+                mv -f ./supabase-state.tar.gz.offsite ./supabase-state.tar.gz
+                echo "  ✅ state recovered from the off-site Cloudflare backup"
+              else
+                rm -f ./supabase-state.tar.gz.offsite
+                echo "::error::state archive is corrupt and no off-site copy could be restored. Refusing to continue as a silent fresh start. Delete the bad supabase-db-* cache entries or restore from Cloudflare KV, then re-run."
+                exit 1
+              fi
+            fi
+            # Inject the pgsodium root key into the db-config named volume BEFORE the
+            # DB boots, so the same encryption key is used and Vault data stays decryptable.
+            if [ -f ./pgsodium_root.key ]; then
+              echo "   Injecting pgsodium root key into db-config volume..."
+              DB_VOL=db-config
+              if ! docker volume inspect "$DB_VOL" >/dev/null 2>&1; then
+                echo "::error::required PostgreSQL db-config volume is missing; refusing to generate a replacement encryption key"
+                exit 1
+              fi
+              if docker run --rm -v "$DB_VOL":/etc/postgresql-custom \
+                -v "$PWD/pgsodium_root.key:/tmp/pgsodium_root.key:ro" \
+                supabase/postgres:17.6.1.136 sh -c "cp /tmp/pgsodium_root.key /etc/postgresql-custom/pgsodium_root.key && chmod 644 /etc/postgresql-custom/pgsodium_root.key"; then
+                echo "   pgsodium root key injected into $DB_VOL"
+              else
+                echo "::error::pgsodium key injection failed; refusing to start with a different Vault encryption key"
+                exit 1
+              fi
+              rm -f ./pgsodium_root.key
+            else
+              echo "    No pgsodium key in archive (fresh encryption key will be generated)"
+            fi
+            # Committed functions (e.g. the 'logs' system function) MUST win over
+            # stale copies restored from an older session's archive  re-apply
+            # tracked files after extraction. Untracked user functions (sample, )
+            # stay as restored.
+            git checkout -- volumes/functions/ 2>/dev/null || true
+            echo "   functions: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
+            echo "   snippets:  $(ls volumes/snippets 2>/dev/null | tr '\n' ' ')"
+            if [ -f ./db-backups/manifest.tsv ]; then
+              echo "    Database set: $(wc -l < ./db-backups/manifest.tsv | tr -d ' ') database(s) will be restored by restore_db()"
+            elif [ -f ./backup.dump ]; then
+              echo "    Legacy DB dump: $(du -h ./backup.dump | cut -f1)  will be restored by restore_db()"
+            else
+              echo "    DB dump: absent (fresh database)"
+            fi
+            if [ -f ./dump.rdb ]; then
+              echo "   Redis dump: $(du -h ./dump.rdb | cut -f1)  restoring to volumes/redis/data"
+              mkdir -p volumes/redis/data
+              cp -f ./dump.rdb volumes/redis/data/dump.rdb
+              chmod -R 777 volumes/redis/data
+              rm -f ./dump.rdb
+            elif [ -f ./volumes/redis/data/dump.rdb ]; then
+              echo "   Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1)  ready for redis container"
+              chmod -R 777 volumes/redis/data 2>/dev/null || true
+            fi
+            if [ -d ./appendonlydir ]; then
+              AOF_FILE_COUNT=0
+              while IFS= read -r AOF_LINE || [ -n "$AOF_LINE" ]; do
+                AOF_LINE="${AOF_LINE%$'\r'}"
+                [ -n "$AOF_LINE" ] || continue
+                if ! [[ "$AOF_LINE" =~ ^file[[:space:]]+(appendonly\.aof\.[0-9]+\.(base\.rdb|incr\.aof))[[:space:]]+seq[[:space:]]+([0-9]+)[[:space:]]+type[[:space:]]+([bi])$ ]]; then
+                  echo "::error::Redis AOF manifest references an invalid or missing file"
+                  exit 1
+                fi
+                AOF_FILE="${BASH_REMATCH[1]}"
+                AOF_KIND="${BASH_REMATCH[4]}"
+                if [ ! -f "./appendonlydir/$AOF_FILE" ] \
+                   || { [ "$AOF_KIND" = "b" ] && [ ! -s "./appendonlydir/$AOF_FILE" ]; } \
+                   || { [ "$AOF_KIND" = "i" ] && [[ "$AOF_FILE" != *.incr.aof ]]; } \
+                   || { [ "$AOF_KIND" = "b" ] && [[ "$AOF_FILE" != *.base.rdb ]]; }; then
+                  echo "::error::Redis AOF manifest references an invalid or missing file"
+                  exit 1
+                fi
+                AOF_FILE_COUNT=$((AOF_FILE_COUNT + 1))
+              done < ./appendonlydir/appendonly.aof.manifest
+              if [ ! -s ./appendonlydir/appendonly.aof.manifest ] || [ "$AOF_FILE_COUNT" -eq 0 ]; then
+                echo "::error::Redis AOF archive is incomplete; refusing to restore it"
+                exit 1
+              fi
+              mkdir -p ./volumes/redis/data
+              rm -rf ./volumes/redis/data/appendonlydir.restore
+              cp -a ./appendonlydir ./volumes/redis/data/appendonlydir.restore
+              rm -rf ./volumes/redis/data/appendonlydir.previous
+              [ ! -d ./volumes/redis/data/appendonlydir ] \
+                || mv ./volumes/redis/data/appendonlydir ./volumes/redis/data/appendonlydir.previous
+              if ! mv ./volumes/redis/data/appendonlydir.restore ./volumes/redis/data/appendonlydir; then
+                [ ! -d ./volumes/redis/data/appendonlydir.previous ] \
+                  || mv ./volumes/redis/data/appendonlydir.previous ./volumes/redis/data/appendonlydir
+                echo "::error::could not install the validated Redis AOF archive"
+                exit 1
+              fi
+              rm -rf ./volumes/redis/data/appendonlydir.previous
+              chmod -R 777 ./volumes/redis/data
+              echo "   Redis AOF restored to volumes/redis/data/appendonlydir"
+            else
+              rm -rf ./volumes/redis/data/appendonlydir
+            fi
+          else
+            echo "  No state archive  fresh start"
+            echo "::warning::No state archive found anywhere (cache miss or first run) — starting with a fresh Supabase database."
+          fi
+
+          # Persistence baseline: record exactly what this session restored, so
+          # the shutdown step can prove the archive it saves is not older or
+          # smaller than its own input. Captured here - after extraction, before
+          # the first new snapshot overwrites ./state-ts and the archive.
+          rm -f ./.state-baseline
+          if [ -f ./supabase-state.tar.gz ]; then
+            BASELINE_BYTES=$(wc -c < ./supabase-state.tar.gz | tr -d ' \n')
+            BASELINE_TS=$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+            printf 'size=%s\nts=%s\n' "${BASELINE_BYTES:-0}" "${BASELINE_TS:-0}" > ./.state-baseline
+            echo "   state baseline: ${BASELINE_BYTES:-0} bytes, state-ts ${BASELINE_TS:-unknown}"
+          fi
+
+          if ! bash utils/state-settings.sh restore; then
+            echo "::error::persisted runtime settings could not be restored"
+            exit 1
+          fi
+          if [ -z "$DASHBOARD_PASSWORD" ] || [ -z "$REDIS_DASHBOARD_PASSWORD" ]; then
+            echo "::error::dashboard passwords must be configured as GitHub Actions secrets"
+            exit 1
+          fi
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          env_file = Path(".env")
+          lines = env_file.read_text().splitlines()
+          settings = {
+              "DASHBOARD_USERNAME": "supabase",
+              "DASHBOARD_PASSWORD": os.environ["DASHBOARD_PASSWORD"],
+              "REDIS_DASHBOARD_USER": "redis",
+              "REDIS_DASHBOARD_PASSWORD": os.environ["REDIS_DASHBOARD_PASSWORD"],
+          }
+          for key, value in settings.items():
+              prefix = f"{key}="
+              lines = [line for line in lines if not line.startswith(prefix)]
+              lines.append(f"{key}={value}")
+          env_file.write_text("\n".join(lines) + "\n")
+          PY
+          chmod 600 .env
+          echo "Supabase and Redis dashboard credentials applied from Actions secrets."
+          # Fail closed on an archive that restored no USABLE database backup.
+          # Checking only for the db-backups DIRECTORY was not enough: restore_db()
+          # prints "No database backup found; starting a fresh database" and keeps
+          # going when the directory exists but the manifest/globals are missing,
+          # which booted an empty stack and then snapshotted it over the good archive.
+          if [ -f ./supabase-state.tar.gz ] \
+             && [ ! -f ./backup.dump ] \
+             && { [ ! -s ./db-backups/manifest.tsv ] || [ ! -s ./db-backups/globals.sql ]; }; then
+            echo "::error::state archive contains no usable database backup (manifest/globals missing); refusing to start a silent fresh database"
+            exit 1
+          fi
+
+          # Ensure the 'main' edge function exists BEFORE containers start.
+          # (edge-runtime boots with --main-service /home/deno/functions/main,
+          # so 'main' must exist at compose-up time or the service errors out.)
+          #
+          #  'main' MUST be the dispatcher (official Supabase pattern): the
+          # edge-runtime hands EVERY request to 'main', which then loads
+          # /home/deno/functions/<name> per request via EdgeRuntime.userWorkers.
+          # A naive "Hello from main" fallback silently swallows every other
+          # function (logs, sample, ...)  exactly the bug we hit with /api/logs.
+          # We ALWAYS overwrite main after the state-archive restore so an older
+          # archived "Hello from main" can never shadow the router again.
+          mkdir -p volumes/functions/main volumes/snippets
+          cat > volumes/functions/main/index.ts <<'EOF'
+          // Dispatcher: routes /<function_name>/* to /home/deno/functions/<function_name>
+          // (official Supabase self-hosted pattern  functions load from disk per request)
+          Deno.serve(async (req) => {
+            const url = new URL(req.url);
+            const name = url.pathname.split('/')[1] || '';
+            if (!name) {
+              // Edge-runtime root  report alive (used by /api/logs/health)
+              return new Response(JSON.stringify({ ok: true, service: 'edge-runtime' }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+            const servicePath = `/home/deno/functions/${name}`;
+            try {
+              const worker = await EdgeRuntime.userWorkers.create({
+                servicePath,
+                memoryLimitMb: 150,
+                workerTimeoutMs: 60 * 1000,
+                noModuleCache: false,
+                importMapPath: null,
+                envVars: Object.entries(Deno.env.toObject()),
+              });
+              return await worker.fetch(req);
+            } catch (e) {
+              return new Response(JSON.stringify({ msg: String(e) }), {
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+          });
+          EOF
+          echo "   edge functions ready: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
+
+      # NOTE: no in-session cache helper. GitHub no longer provides the
+      # cache-service env vars (ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN) to
+      # run: steps, so snapshots can only be persisted via actions/cache steps
+      # (end-of-run save below). The keepalive loop writes snapshots to disk so
+      # that save always has the freshest archive.
+
+      #  Prune stale cache entries (best-effort, keeps newest 3) 
+      # Keeps the Actions cache small (end-of-run state archives) so it never
+      # hits the 10GB repo cap. Also re-run hourly from inside the keepalive
+      # loop. Needs 'actions: write'; if it isn't granted, old entries just
+      # age out via GitHub's LRU eviction instead.
+      - name:  Prune stale snapshot cache entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # prune-caches.sh reads GITHUB_TOKEN — without it the script aborted
+          # with "unbound variable" and never pruned a single entry.
+          GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+          bash utils/prune-caches.sh || true
+          bash utils/cloudflare-backup.sh prune || true
+
+      # Restore databases before starting the application services.
+      - name:  Start containers + restore DB
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          cd "$SUPABASE_DIR"
+
+          # Keep application connections away while the database is restored.
+          STATUS_FILE=$(mktemp)
+          echo 0 > "$STATUS_FILE"
+          docker compose up -d db redis
+          echo "Database and Redis started; waiting for database initialization..."
+
+          restore_db() {
+            # FIX: docker compose wait <svc> blocks until the container STOPS (not
+            # until healthy), so the old `timeout 120 docker compose wait db` always
+            # timed out and the restore NEVER ran. Poll pg_isready instead.
+            DB_READY=0
+            for i in $(seq 1 60); do
+              if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+                DB_READY=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$DB_READY" -ne 1 ]; then
+              echo "  Timed out waiting for db to accept connections"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
+            echo "PostgreSQL is accepting connections..."
+
+            #  CRITICAL: Wait for init scripts to finish 
+            # pg_isready returns success BEFORE Supabase's init scripts complete.
+            # If we restore before they finish, pg_restore conflicts with them
+            # and fails silently (data lost). We wait for 'supabase_functions'
+            # (created by init-scripts/98-webhooks.sql) OR '_supabase' (created
+            # by migrations/97-_supabase.sql). Both are created by our init
+            # scripts, not the base image. After either exists, remaining
+            # scripts (99-jwt, 99-roles, zz-init-data) only set GUCs/passwords
+            # and won't conflict with pg_restore.
+            echo "Waiting for Supabase init scripts to complete..."
+            INIT_TIMEOUT=120
+            INIT_ELAPSED=0
+            while [ $INIT_ELAPSED -lt $INIT_TIMEOUT ]; do
+              if docker compose exec -T db psql -U postgres -t -c \
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name IN ('_supabase','supabase_functions')" 2>/dev/null | grep -q 1; then
+                echo " Supabase init scripts complete"
+                break
+              fi
+              sleep 1
+              INIT_ELAPSED=$((INIT_ELAPSED + 1))
+            done
+            if [ $INIT_ELAPSED -ge $INIT_TIMEOUT ]; then
+              echo "::error::timed out waiting for database initialization; refusing to restore over an incomplete database"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
+
+            if [ -s ./postgresql.auto.conf ]; then
+              echo "Restoring PostgreSQL ALTER SYSTEM settings..."
+              if ! docker compose exec -T db sh -c \
+                   'cat > "$PGDATA/postgresql.auto.conf" && chmod 600 "$PGDATA/postgresql.auto.conf"' \
+                   < ./postgresql.auto.conf; then
+                echo "::error::could not install the saved PostgreSQL settings"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              if ! docker compose restart db >/dev/null; then
+                echo "::error::PostgreSQL could not restart with the saved settings"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              DB_READY=0
+              for i in $(seq 1 60); do
+                if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+                  DB_READY=1
+                  break
+                fi
+                sleep 2
+              done
+              if [ "$DB_READY" -ne 1 ]; then
+                echo "::error::PostgreSQL did not become ready after restoring saved settings"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+            fi
+
+            if [ -d ./db-backups ] \
+               && { [ ! -s ./db-backups/manifest.tsv ] || [ ! -s ./db-backups/globals.sql ]; }; then
+              echo "::error::database backup set is incomplete (manifest or PostgreSQL globals are missing)"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
+
+            if [ -s ./db-backups/manifest.tsv ] && [ -s ./db-backups/globals.sql ]; then
+              echo "Restoring all databases and PostgreSQL roles from the complete state backup..."
+              PREFLIGHT_NAMES=$(mktemp)
+              PREFLIGHT_COUNT=0
+              mapfile -t MANIFEST_ENTRIES < ./db-backups/manifest.tsv
+              for MANIFEST_LINE in "${MANIFEST_ENTRIES[@]}"; do
+                [ -n "$MANIFEST_LINE" ] || continue
+                IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 EXTRA_FIELD <<< "$MANIFEST_LINE"
+                [ -n "$DB_DUMP_NAME" ] || continue
+                if [ -n "$EXTRA_FIELD" ] \
+                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.dump$ ]] \
+                   || [ -z "$DB_NAME_B64" ] || [ -z "$DB_OWNER_B64" ]; then
+                  echo "::error::invalid database entry in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                DB_NAME="$(printf '%s' "$DB_NAME_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database name in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                }
+                DB_OWNER="$(printf '%s' "$DB_OWNER_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database owner in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                }
+                if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
+                   || [ "$(printf '%s' "$DB_NAME" | base64 -w0)" != "$DB_NAME_B64" ] \
+                   || [ "$(printf '%s' "$DB_OWNER" | base64 -w0)" != "$DB_OWNER_B64" ] \
+                   || grep -Fxq "$DB_NAME" "$PREFLIGHT_NAMES" \
+                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                  echo "::error::invalid or duplicate database metadata in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                printf '%s\n' "$DB_NAME" >> "$PREFLIGHT_NAMES"
+                if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME" </dev/null; then
+                  echo "::error::database dump failed pre-restore validation: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                if ! DUMP_DB_NAME=$(docker compose exec -T db pg_restore -U postgres \
+                  --list "/tmp/$DB_DUMP_NAME" </dev/null 2>/dev/null \
+                  | sed -n -e 's/^;[[:space:]]*dbname: //p' \
+                      -e 's/^; Database: //p' | tr -d '\r'); then
+                  echo "::error::database dump failed pre-restore validation: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                if [ "$DUMP_DB_NAME" != "$DB_NAME" ]; then
+                  echo "::error::database dump name does not match the manifest entry: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                PREFLIGHT_COUNT=$((PREFLIGHT_COUNT + 1))
+              done
+              rm -f "$PREFLIGHT_NAMES"
+              if [ "$PREFLIGHT_COUNT" -eq 0 ]; then
+                echo "::error::database manifest contains no database entries"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 -type f -name 'db-*.dump' | wc -l)
+              if [ "$DUMP_FILE_COUNT" -ne "$PREFLIGHT_COUNT" ]; then
+                echo "::error::database backup contains unreferenced or missing dump files"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+
+              # Pre-create roles needed by extensions/services (like realtime) so
+              # that they always exist even before globals or DB restores run.
+              docker compose exec -T db psql -U supabase_admin -d postgres </dev/null \
+                -c "DO \$\$ BEGIN CREATE ROLE supabase_realtime_admin NOINHERIT CREATEROLE REPLICATION; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;" \
+                -c "DO \$\$ BEGIN CREATE ROLE supabase_replication_admin NOINHERIT REPLICATION; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;" >/dev/null 2>&1 || true
+
+              GLOBAL_LOG=$(mktemp)
+              GLOBAL_RESTORE_FILE=$(mktemp)
+              # The filter drops a GRANT/REVOKE only when the role being
+              # granted IS a managed one. It used to drop them when either side
+              # was managed, which silently discarded memberships such as
+              # "GRANT app_owner TO authenticated" - audited against a real
+              # server: that membership was gone after every restart. Keeping
+              # them is safe because the managed grantee is recreated by the
+              # image init scripts before the globals are replayed.
+              # (Kept outside the quoted awk program: an apostrophe here would
+              # terminate the shell string.)
+              if ! awk '
+                function managed_role(role) {
+                  gsub(/"/, "", role)
+                  sub(/;$/, "", role)
+                  return role == "anon" || role == "authenticated" \
+                    || role == "authenticator" || role == "dashboard_user" \
+                    || role == "pgbouncer" || role == "postgres" \
+                    || role == "service_role" \
+                    || role == "supabase_admin" || role == "supabase_auth_admin" \
+                    || role == "supabase_functions_admin" || role == "supabase_storage_admin"
+                }
+                ($1 == "CREATE" && $2 == "ROLE" && managed_role($3)) { next }
+                ($1 == "ALTER" && $2 == "ROLE" && managed_role($3)) { next }
+                ($1 == "COMMENT" && $2 == "ON" && $3 == "ROLE" && managed_role($4)) { next }
+              (($1 == "GRANT" && $3 == "TO") || ($1 == "REVOKE" && $3 == "FROM")) \
+                && managed_role($2) { next }
+                { print }
+              ' ./db-backups/globals.sql > "$GLOBAL_RESTORE_FILE"; then
+                echo "::error::could not prepare PostgreSQL globals for restore"
+                rm -f "$GLOBAL_LOG" "$GLOBAL_RESTORE_FILE"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              docker compose exec -T db psql -U supabase_admin -d postgres \
+                < "$GLOBAL_RESTORE_FILE" >"$GLOBAL_LOG" 2>&1 || true
+              GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
+                | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
+              rm -f "$GLOBAL_RESTORE_FILE"
+              if [ -n "$GLOBAL_ERRORS" ]; then
+                echo "::error::failed to restore PostgreSQL roles/global settings"
+                echo "$GLOBAL_ERRORS" | head -10 | sed 's/^/    /'
+                rm -f "$GLOBAL_LOG"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              rm -f "$GLOBAL_LOG"
+
+              RESTORE_FAILED=0
+              RESTORE_COUNT=0
+              for MANIFEST_LINE in "${MANIFEST_ENTRIES[@]}"; do
+                [ -n "$MANIFEST_LINE" ] || continue
+                IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 <<< "$MANIFEST_LINE"
+                [ -n "$DB_DUMP_NAME" ] || continue
+                case "$DB_DUMP_NAME" in
+                  db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump) ;;
+                  *)
+                    echo "::error::invalid database dump entry in backup manifest"
+                    RESTORE_FAILED=1
+                    break
+                    ;;
+                esac
+                DB_NAME="$(printf '%s' "$DB_NAME_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database name in backup manifest"
+                  RESTORE_FAILED=1
+                  break
+                }
+                DB_OWNER="$(printf '%s' "$DB_OWNER_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database owner in backup manifest"
+                  RESTORE_FAILED=1
+                  break
+                }
+                if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
+                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                  echo "::error::incomplete database entry in backup manifest: $DB_DUMP_NAME"
+                  RESTORE_FAILED=1
+                  break
+                fi
+                echo "Restoring database: $DB_NAME"
+                if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME" </dev/null; then
+                  echo "::error::failed to copy database dump: $DB_DUMP_NAME"
+                  RESTORE_FAILED=1
+                  break
+                fi
+                RESTORE_LOG=$(mktemp)
+                RESTORE_STATUS=0
+                if [ "$DB_NAME" = "postgres" ]; then
+                  # The root database 'postgres' must NEVER be dropped:
+                  # background workers like pg_cron run inside it, and dropping
+                  # 'postgres' triggers "FATAL: database postgres does not exist",
+                  # causing postmaster crash recovery and aborting pg_restore.
+                  # Instead, wipe non-system schemas with CASCADE so pg_restore
+                  # can cleanly recreate all user/app objects without conflicts.
+                  CLEAN_LOG=$(mktemp)
+                  if ! printf '%s\n' \
+                       'DO $$' \
+                       'DECLARE s text;' \
+                       'BEGIN' \
+                       '  FOR s IN' \
+                       '    SELECT nspname FROM pg_namespace' \
+                       '    WHERE nspname NOT IN ('\''pg_catalog'\'', '\''information_schema'\'', '\''pg_toast'\'', '\''cron'\'')' \
+                       '      AND nspname NOT LIKE '\''pg_%'\''' \
+                       '  LOOP' \
+                       '    EXECUTE '\''DROP SCHEMA IF EXISTS '\'' || quote_ident(s) || '\'' CASCADE;'\'';' \
+                       '  END LOOP;' \
+                       'END $$;' \
+                       'CREATE SCHEMA IF NOT EXISTS public;' \
+                       'GRANT ALL ON SCHEMA public TO postgres, public, anon, authenticated, service_role;' \
+                       | docker compose exec -T db psql -U supabase_admin -d postgres \
+                         -v ON_ERROR_STOP=1 </dev/null >"$CLEAN_LOG" 2>&1; then
+                    echo "::error::failed to clean schemas in database postgres before restore"
+                    cat "$CLEAN_LOG" | sed 's/^/    /'
+                    rm -f "$CLEAN_LOG"
+                    RESTORE_FAILED=1
+                    break
+                  fi
+                  rm -f "$CLEAN_LOG"
+
+                  # Replay database-level GUCs (ALTER DATABASE ... SET) from the archive
+                  docker compose exec -T db pg_restore -C -f - "/tmp/$DB_DUMP_NAME" 2>/dev/null \
+                    | grep -E '^ALTER DATABASE [^ ]+ SET ' \
+                    | docker compose exec -T db psql -U supabase_admin -d postgres >/dev/null 2>&1 || true
+
+                  docker compose exec -T db pg_restore -U supabase_admin \
+                    --clean --if-exists --disable-triggers --exit-on-error \
+                    -d postgres "/tmp/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
+                  if [ "$RESTORE_STATUS" -ne 0 ]; then
+                    echo "::error::PostgreSQL restore failed for postgres:"
+                    tail -20 "$RESTORE_LOG" | sed 's/^/    /'
+                    echo "=== POSTGRESQL CONTAINER LOGS ==="
+                    docker compose logs --tail=40 db 2>&1 | sed 's/^/    /' || true
+                    RESTORE_FAILED=1
+                  fi
+                else
+                  # Non-system databases (e.g. _supabase, tenant databases):
+                  # Terminate active sessions and drop existing database so
+                  # pg_restore --create can recreate it cleanly.
+                  DROP_LOG=$(mktemp)
+                  if ! docker compose exec -T db dropdb -U supabase_admin \
+                       --maintenance-db=template1 --if-exists --force "$DB_NAME" </dev/null >"$DROP_LOG" 2>&1; then
+                    echo "::error::failed to drop database before restore: $DB_NAME"
+                    cat "$DROP_LOG" | sed 's/^/    /'
+                    rm -f "$DROP_LOG"
+                    RESTORE_FAILED=1
+                    break
+                  fi
+                  rm -f "$DROP_LOG"
+
+                  # MUST be the image's superuser: not $DB_OWNER, and not merely
+                  # `postgres` — on the real stack `postgres` is a plain role, so
+                  # even DROP DATABASE on a Supabase-managed database died with
+                  # "must be owner of database _supabase" (live chain run on the
+                  # real archive). `supabase_admin` owns the image-created
+                  # databases and is superuser. --create issues CREATE DATABASE
+                  # (needs CREATEDB) and --disable-triggers needs superuser.
+                  docker compose exec -T db pg_restore -U supabase_admin \
+                    --clean --if-exists --create --disable-triggers --exit-on-error \
+                    -d template1 "/tmp/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
+                  if [ "$RESTORE_STATUS" -ne 0 ]; then
+                    echo "::error::PostgreSQL restore failed for $DB_NAME:"
+                    tail -20 "$RESTORE_LOG" | sed 's/^/    /'
+                    echo "=== POSTGRESQL CONTAINER LOGS ==="
+                    docker compose logs --tail=40 db 2>&1 | sed 's/^/    /' || true
+                    RESTORE_FAILED=1
+                  fi
+                fi
+                rm -f "$RESTORE_LOG"
+                if [ "$RESTORE_FAILED" -ne 0 ]; then
+                  break
+                fi
+              # Also run as a superuser: pg_restore just recreated the database
+              # as supabase_admin, so $DB_OWNER could not alter it ("must be
+              # owner of database"). A superuser can hand ownership to any role.
+              if ! printf '%s\n' 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' \
+                   | docker compose exec -T db psql -U supabase_admin -d template1 \
+                     -v ON_ERROR_STOP=1 -v "db_name=$DB_NAME" -v "db_owner=$DB_OWNER" </dev/null \
+                     >/dev/null; then
+                  echo "::error::failed to restore database owner for $DB_NAME"
+                  RESTORE_FAILED=1
+                  break
+                fi
+                RESTORE_COUNT=$((RESTORE_COUNT + 1))
+              done
+
+              if [ "$RESTORE_COUNT" -eq 0 ]; then
+                echo "::error::database manifest did not contain any restorable databases"
+                RESTORE_FAILED=1
+              fi
+              if [ "$RESTORE_FAILED" -ne 0 ]; then
+                echo "::error::one or more database backups could not be fully restored"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              echo " All databases and PostgreSQL global objects restored"
+            elif [ -f ./backup.dump ]; then
+              echo "Restoring legacy database backup ($(du -h ./backup.dump | cut -f1))..."
+              if ! docker compose cp ./backup.dump db:/tmp/backup.dump; then
+                echo "::error::failed to copy legacy database backup into the container"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              if ! docker compose exec -T db pg_restore -U supabase_admin \
+                   --list /tmp/backup.dump >/dev/null; then
+                echo "::error::legacy database backup is not a valid PostgreSQL archive"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              # Legacy full-database dumps contain Supabase-managed schemas and
+              # extensions. Cleaning objects inside the initialized database
+              # leaves dependency/permission conflicts; replace the database
+              # from template1, then restore into the empty database.
+              if ! docker compose exec -T db dropdb -U supabase_admin \
+                   --maintenance-db=template1 --if-exists --force postgres; then
+                echo "::error::could not replace database before legacy restore"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              if ! docker compose exec -T db createdb -U supabase_admin \
+                   --template=template1 postgres; then
+                echo "::error::could not recreate database for legacy restore"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              RESTORE_LOG=$(mktemp)
+              if ! docker compose exec -T db pg_restore -U supabase_admin -d postgres \
+                 --no-owner --no-privileges --disable-triggers --exit-on-error --jobs 2 \
+                   /tmp/backup.dump 2>"$RESTORE_LOG"; then
+                echo "::error::legacy database restore failed"
+                tail -20 "$RESTORE_LOG" | sed 's/^/    /'
+                rm -f "$RESTORE_LOG"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              rm -f "$RESTORE_LOG"
+            else
+              echo "No database backup found; starting a fresh database"
+              return
+            fi
+
+            #  Verify restore success 
+            echo "Verifying restore..."
+            # Count tables in the 'public' schema specifically  on a fresh Supabase
+            # init, 'public' has 0 tables. User data lives in 'public' and custom
+            # schemas, so counting public tables isolates user-created data from
+            # system schemas (auth, realtime, extensions, etc.)
+            PUBLIC_TABLES=$(docker compose exec -T db psql -U postgres -t -A -c \
+              "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" 2>/dev/null || echo "0")
+            echo " User tables (public schema): $PUBLIC_TABLES"
+            if [ "$PUBLIC_TABLES" -gt 0 ] 2>/dev/null; then
+              echo " Restore verified  user data present in public schema"
+            else
+              # Could be a fresh DB with no user tables, OR a failed restore
+              SYSTEM_TABLES=$(docker compose exec -T db psql -U postgres -t -A -c \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema IN ('auth','realtime','_realtime','supabase_functions','_analytics','_supabase','extensions','storage');" 2>/dev/null || echo "0")
+              echo " System tables (all schemas): $SYSTEM_TABLES"
+              if [ "$SYSTEM_TABLES" -gt 0 ] 2>/dev/null; then
+                echo "  System schemas are present  this may be a fresh start or a restore of a DB without user tables"
+              else
+                echo "  No tables found anywhere  database may be empty!"
+              fi
+            fi
+          }
+
+          restore_db
+          if [ "$(cat "$STATUS_FILE")" -ne 0 ]; then
+            echo "::error::database restore failed; application services will not be started"
+            cat "$STATUS_FILE"
+            rm -f "$STATUS_FILE"
+            exit 1
+          fi
+
+           docker compose up -d || true
+          echo "Database restore complete; all Supabase services are starting..."
+
+          sleep 15
+          echo "=== KONG LOGS ==="
+          docker compose logs kong 2>&1 | tail -50 || true
+          echo "=== KONG STATUS ==="
+          docker compose ps kong 2>&1 || true
+
+          # FIX: supavisor (pooler) crash-loops at boot  it starts before the
+          # DB is fully stable and its migrate/eval fail, causing restart loops.
+          # Restart it after restore, then POLL until healthy (up to 60s).
+          echo "   Restarting supavisor after DB restore..."
+          docker compose restart supavisor > /dev/null 2>&1 || echo "    pooler restart signal failed"
+          POOLER_READY=0
+          for i in $(seq 1 12); do
+            sleep 5
+            STATUS=$(docker compose ps supavisor --format json 2>/dev/null | grep -o '"Health":"[^"]*"' | cut -d'"' -f4 || true)
+            STATE=$(docker compose ps supavisor --format json 2>/dev/null | grep -o '"State":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$STATE" = "running" ] && [ "$STATUS" = "healthy" ]; then
+              echo "   supavisor healthy after ${i}x5s"
+              POOLER_READY=1
+              break
+            elif [ "$i" -eq 6 ] && [ "$POOLER_READY" -eq 0 ]; then
+              # Give it one more restart at 30s if still not healthy
+              echo "   supavisor still starting  second restart at 30s..."
+              docker compose restart supavisor > /dev/null 2>&1 || true
+            fi
+          done
+          if [ "$POOLER_READY" -eq 0 ]; then
+            echo "    supavisor not healthy after 60s  Docker restart policy will recover it"
+          fi
+
+          ERR=$(cat "$STATUS_FILE")
+          rm -f "$STATUS_FILE"
+          if [ "$ERR" -ne 0 ]; then
+            echo "WARNING: Some services failed to start"
+          fi
+          echo "All services ready!"
+          docker compose ps 2>/dev/null | head -15
+
+      #  Apply committed migrations (versioned schema changes)
+      # Applies supabase/migrations/*.sql — Supabase PLATFORM SQL only — on top
+      # of the restored DB (fresh DBs already get the volumes/db/*.sql init
+      # scripts at first boot). The chuglii application layer lives in
+      # supabase/migrations-app/ and is applied separately via ./remote.sh with
+      # the service key, never at boot. Files are tracked in
+      # public._schema_migrations so each one runs only once across
+      # sessions  the tracking table itself is carried by the state backup.
+      - name:  Apply committed migrations
+        run: |
+          cd "$SUPABASE_DIR"
+
+          PG_READY=0
+          for i in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+              PG_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PG_READY" -ne 1 ]; then
+            echo "  Postgres not ready  skipping migrations"
+            exit 0
+          fi
+
+          # Grant postgres read access to auth schema so any platform migration
+          # that JOINs auth.users succeeds.
+          docker compose exec -T db psql -U postgres -c "
+            GRANT USAGE ON SCHEMA auth TO postgres;
+            GRANT SELECT ON ALL TABLES IN SCHEMA auth TO postgres;
+          " > /dev/null 2>&1 || true
+
+          docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+          CREATE TABLE IF NOT EXISTS public._schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz DEFAULT now()
+          );
+          ALTER TABLE public._schema_migrations ENABLE ROW LEVEL SECURITY;
+          REVOKE ALL ON TABLE public._schema_migrations FROM PUBLIC, anon, authenticated;
+          SQL
+
+          APPLIED=0
+          for f in migrations/*.sql; do
+            [ -e "$f" ] || continue
+            NAME=$(basename "$f")
+            if docker compose exec -T db psql -U postgres -t -A -c \
+              "SELECT 1 FROM public._schema_migrations WHERE name = '$NAME'" 2>/dev/null | grep -q 1; then
+              echo "   $NAME already applied  skipping"
+              continue
+            fi
+            echo "   Applying $NAME..."
+            if docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 < "$f" >/dev/null 2>&1; then
+              docker compose exec -T db psql -U postgres -c \
+                "INSERT INTO public._schema_migrations(name) VALUES ('$NAME')" >/dev/null 2>&1 || true
+              echo "   $NAME applied"
+              APPLIED=$((APPLIED + 1))
+            else
+              echo "    $NAME FAILED  not marked applied (will retry next session); fix and re-commit"
+            fi
+          done
+          if [ "$APPLIED" -eq 0 ]; then
+            echo "  No new migrations (supabase/migrations empty or up to date)"
+          fi
+
+      #  Confirm all unconfirmed users (fixes stuck signups) 
+      # If ENABLE_EMAIL_AUTOCONFIRM was false in a previous session and Inbucket
+      # failed to deliver the confirmation email, users remain stuck with
+      # email_confirmed_at = NULL. This catches them on every startup.
+      - name:  Confirm all unconfirmed users
+        run: |
+          cd "$SUPABASE_DIR"
+          docker compose exec -T db psql -U postgres -c \
+            "UPDATE auth.users SET email_confirmed_at = NOW(), email_change_confirm_status = 0 WHERE email_confirmed_at IS NULL;"
+          echo " All unconfirmed users confirmed"
+
+      #  Verify restored state (READ-ONLY) 
+      # Reports what survived the backup  cache  restore cycle so you can
+      # confirm your changes persisted. Deliberately creates nothing: tables,
+      # rows and settings you deleted stay deleted (no more auto-seed).
+      - name:  Verify restored state (read-only)
+        run: |
+          cd "$SUPABASE_DIR"
+
+          # Wait until Postgres is accepting connections
+          PG_READY=0
+          for i in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+              PG_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PG_READY" -ne 1 ]; then
+            echo "  Timed out waiting for Postgres to become ready  continuing anyway"
+          fi
+
+          echo "=============================================================="
+          echo "   cache hit:      ${{ steps.cache-db.outputs.cache-hit }}"
+          if [ -f ./supabase-state.tar.gz ]; then
+            echo "    restored archive: $(du -h ./supabase-state.tar.gz | cut -f1)"
+          else
+            echo "    restored archive: none (fresh start)"
+          fi
+          echo ""
+          echo "   user tables (public schema):"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" 2>/dev/null | tr -d '[:space:]' | sed 's/^/    /'
+          echo "    public tables:"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT string_agg(table_name, ', ') FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo "   edge functions:"
+          ls volumes/functions 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo "   studio snippets:"
+          ls volumes/snippets 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo "   seed_log (from earlier sessions, if any):"
+          docker compose exec -T db psql -U postgres -c "SELECT id, seed_id, seeded_at, note FROM public.seed_log ORDER BY id;" 2>/dev/null || echo "    (no seed_log table  auto-seed removed)"
+          echo "   vault (decryptable only if the pgsodium root key persisted):"
+          if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.decrypted_secrets')" 2>/dev/null | grep -q "decrypted_secrets"; then
+            docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets LIMIT 5;" 2>/dev/null || echo "      vault decryption FAILED (pgsodium key changed?)"
+          else
+            echo "    (vault schema not present)"
+          fi
+          echo "   migration tracker (platform + app, restored from the archive):"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT COALESCE(string_agg(name, ', ' ORDER BY name), '(none)') FROM public._schema_migrations;" 2>/dev/null \
+            | sed 's/^/    /' || echo "    (tracker missing — migrations will re-run)"
+          echo "   databases restored from the archive:"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT COALESCE(string_agg(datname, ', ' ORDER BY datname), '(none)') FROM pg_database WHERE datallowconn AND NOT datistemplate;" 2>/dev/null \
+            | sed 's/^/    /'
+          echo "   redis (cache & rate-limiting):"
+          # The container has REDIS_PASSWORD in its environment; pass it so this
+          # is a real PING instead of a NOAUTH error that the `||` hides.
+          docker compose exec -T redis sh -c \
+            'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping' 2>/dev/null \
+            | sed 's/^/    /' || echo "    (redis running, PING failed — check REDIS_PASSWORD)"
+          echo "   redis keyspaces (db0=Kong rate limits, db1=app cache):"
+          docker compose exec -T redis sh -c \
+            'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" info keyspace' 2>/dev/null \
+            | tr -d '\r' | sed 's/^/    /' || echo "    (unavailable)"
+          echo "=============================================================="
+
+      #  Run Supabase (keep alive + on-disk snapshots every 5 minutes) 
+      # Every 5 minutes the FULL state (DB dump + pgsodium key + functions +
+      # snippets) is refreshed on disk; it's persisted to the Actions cache by
+      # the end-of-run cache save below (GitHub doesn't expose cache-service
+      # env vars to run: steps, so mid-session uploads are not possible).
+      - name:   Supabase is LIVE (auto-snapshot every 5 min)
+        id: keepalive
+        env:
+          TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}   # hourly prune-caches.sh needs it too
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+          rm -f ./.snapshot-success
+
+          DURATION=18300  # 5h05m  leaves ~50 min buffer for final backup + cache save
+          # (was 5h30m; the old 25 min shutdown budget was too tight for large DBs
+          # and could cut the cache save off at the 355-min timeout, losing up to
+          # 5h of data on the next restore).
+          END_TIME=$(( $(date +%s) + DURATION ))
+          DOMAIN="$TUNNEL_DOMAIN"
+          REDIS_DOMAIN="redis.${DOMAIN#supabase.}"
+          REDIS_HTTP_URL="https://$REDIS_DOMAIN/functions/v1/redis-http"
+          if [ -z "$CF_TUNNEL_TOKEN" ]; then
+            echo "::error::CF_TUNNEL_TOKEN is required to start the public Cloudflare tunnel"
+            exit 1
+          fi
+
+          KONG_READY=0
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:8000 >/dev/null 2>&1; then
+              KONG_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$KONG_READY" -ne 1 ]; then
+            echo "::error::Kong did not become ready for the Cloudflare Tunnel"
+            exit 1
+          fi
+
+          cloudflared tunnel --no-autoupdate run \
+            --token "$CF_TUNNEL_TOKEN" \
+            > /tmp/cloudflared.log 2>&1 &
+          TUNNEL_PID=$!
+          trap 'kill "$TUNNEL_PID" 2>/dev/null || true; wait "$TUNNEL_PID" 2>/dev/null || true' EXIT
+          TUNNEL_CONNECTED=0
+          for i in $(seq 1 12); do
+            sleep 5
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "cloudflared process exited before registering"
+              tail -30 /tmp/cloudflared.log
+              break
+            fi
+            if grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null; then
+              TUNNEL_CONNECTED=1
+              echo "Cloudflare Tunnel connected and will stay attached to the live session."
+              break
+            fi
+          done
+          if [ "$TUNNEL_CONNECTED" -ne 1 ]; then
+            echo "::error::Cloudflare Tunnel did not register a connection"
+            tail -30 /tmp/cloudflared.log
+            exit 1
+          fi
+          # Read Redis password safely from .env without shell-evaluating JSON values
+          REDIS_PASSWORD=$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+          export REDIS_PASSWORD  # must be exported so snapshot-state.sh subprocess can use it for redis-cli auth
+
+          echo ""
+          echo "+=============================================================+"
+          echo "|         SUPABASE IS LIVE ON GITHUB ACTIONS                  |"
+          echo "+=============================================================+"
+          echo "|                                                             |"
+          echo "|  Studio:        http://localhost:8000                       |"
+          echo "|  Tunnel:        Connected via Cloudflare                    |"
+          echo "|  Studio Domain: https://$DOMAIN                               |"
+          echo "|  Public Redis:  $REDIS_HTTP_URL       |"
+          echo "|  Snapshots:     every 5 min  saved at shutdown             |"
+          echo "|                                                             |"
+          echo "|  Monitor:       https://github.com/$GITHUB_REPOSITORY/actions|"
+          echo "|  Badge:         https://github.com/$GITHUB_REPOSITORY/actions/workflows/supabase-host.yml/badge.svg |"
+          echo "|                                                             |"
+          echo "|  Runs until:    $(date -d @$END_TIME '+%H:%M UTC')             |"
+          echo "|  Auto-restart:  self-chain + hourly schedule                |"
+          echo "|  Remaining:     $(( DURATION / 60 )) min                                 |"
+          echo "|                                                             |"
+          echo "+=============================================================+"
+          echo ""
+
+          # Write clickable links directly to GitHub Actions Run Summary
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "###  Supabase & Redis are LIVE!"
+              echo ""
+              echo "| Service | Link / Endpoint |"
+              echo "|---|---|"
+              echo "|  **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
+              echo "|  **Redis Commander Dashboard** | [https://$REDIS_DOMAIN](https://$REDIS_DOMAIN) |"
+              echo "|  **Permanent public Redis API** | [$REDIS_HTTP_URL]($REDIS_HTTP_URL) *(HTTPS; authenticate with the Supabase service-role key in the \`apikey\` header)* |"
+              echo "|  **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
+              echo "|  **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
+              echo "|  **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
+              echo ""
+              echo "Use the Redis HTTPS API with \`POST $REDIS_HTTP_URL\` and an \`apikey: <SUPABASE_SERVICE_ROLE_KEY>\` header."
+              echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
+              echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "::notice title= Supabase & Redis Live::Studio: https://$DOMAIN | Redis dashboard: https://$REDIS_DOMAIN | Redis API: $REDIS_HTTP_URL"
+
+          #  Keepalive loop + health checks + 5-min on-disk snapshots 
+          # (run_id/run_attempt are used by the final cache-save step's key)
+          SLOT=0
+          SNAPSHOTS=0
+          TICK=0
+          FAILS=0
+          NEXT_SNAP=$(date +%s)
+          while [ $(date +%s) -lt $END_TIME ]; do
+            NOW=$(date +%s)
+
+            # Realtime full-state snapshot every 60 seconds (1 minute):
+            # Dumps DB + keys + functions + Redis, and immediately syncs to
+            # Cloudflare KV and GitHub Release (live-backup).
+            if [ "$NOW" -ge "$NEXT_SNAP" ]; then
+              echo ""
+              echo " [$(date '+%H:%M:%S')] Realtime Snapshot #$SLOT (every 60s)..."
+              export SLOT
+              if bash utils/snapshot-state.sh; then
+                touch ./.snapshot-success
+                SNAPSHOTS=$((SNAPSHOTS + 1))
+              else
+                echo "    snapshot failed; previous archive preserved and this tick will not count as success"
+              fi
+              NEXT_SNAP=$((NOW + 60))
+              SLOT=$((SLOT + 1))
+              # Prune old cache entries & expired KV backups every 15 snapshots (~15 min)
+              if [ $(( SLOT % 15 )) -eq 0 ]; then
+                bash utils/prune-caches.sh >/dev/null 2>&1 || true
+                bash utils/cloudflare-backup.sh prune >/dev/null 2>&1 || true
+              fi
+            fi
+
+            # Health check + heartbeat every 60s (tick = 10s)
+            # Probes BOTH local Kong (localhost:8000) AND the public tunnel
+            # domain (if configured)  so a dead cloudflared or dead Kong both
+            # count. curl exits 0 on any HTTP response (incl. Kong's 401), so
+            # these are liveness checks: they fail only when the endpoint is
+            # unreachable.
+            # NOTE: after 3 CONSECUTIVE failed health checks (~3 min) the step
+            # exits non-zero. The run then concludes 'failure' and the self-chain
+            # dispatches a replacement, so a mid-session crash (Kong/Postgres/
+            # tunnel death) does not idle for the remaining ~5h. The if: always() steps still run
+            # (final backup + cache save), so the freshest state is preserved.
+            if [ $(( TICK % 6 )) -eq 0 ]; then
+              HEALTH_OK=1
+              if ! curl -s -o /dev/null --max-time 15 http://localhost:8000; then
+                HEALTH_OK=0
+                echo "   localhost:8000 (Kong) unreachable"
+              fi
+              for PUBLIC_HOST in "$DOMAIN" "$REDIS_DOMAIN"; do
+                if [ -n "$PUBLIC_HOST" ]; then
+                  PUBLIC_STATUS=$(curl -sS -o /dev/null --max-time 15 \
+                    -w '%{http_code}' "https://$PUBLIC_HOST" || true)
+                  case "$PUBLIC_STATUS" in
+                    000|5??)
+                      HEALTH_OK=0
+                      echo "   tunnel https://$PUBLIC_HOST returned HTTP ${PUBLIC_STATUS:-000}"
+                      ;;
+                  esac
+                fi
+              done
+              if [ "$HEALTH_OK" -eq 1 ]; then
+                FAILS=0
+                REMAINING=$(( (END_TIME - NOW) / 60 ))
+                echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
+              else
+                FAILS=$((FAILS + 1))
+                echo "$(date '+%H:%M:%S') -- Health check failed ($FAILS/3 consecutive)"
+                docker compose ps --no-color 2>/dev/null | head -10 || true
+                if [ "$FAILS" -ge 3 ]; then
+                  echo ""
+                  echo " HEALTH CHECK FAILED 3x IN A ROW  Supabase/tunnel is DOWN. Exiting so the self-chain can restart (cache save still runs)."
+                  exit 1
+                fi
+              fi
+            fi
+            sleep 10
+            TICK=$((TICK + 1))
+
+            # ------------------------------------------------------------------
+            # Graceful operator-triggered shutdown: if the file `.session-stop`
+            # exists in the repo root, exit the keepalive loop (~30s latency).
+            # The run then completes NORMALLY (not cancelled), so the if-always
+            # final-backup and end-of-run cache-save steps still run and the
+            # freshest state archive is persisted to the GitHub Actions cache
+            # for the next session.
+            # Remove the marker (git rm) once the desired session has saved.
+            # ------------------------------------------------------------------
+            if [ $(( TICK % 3 )) -eq 0 ] && curl -sf --max-time 10 -o /dev/null \
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/.session-stop?ref=master"; then
+              echo "  End-session marker (.session-stop) detected  ending session gracefully; state will be saved to cache"
+              break
+            fi
+
+            if [ $(( TICK % 6 )) -eq 0 ]; then printf "."; fi
+          done
+          echo ""
+          echo "Session complete  $SNAPSHOTS snapshots written to disk (saved to cache at shutdown). Starting graceful shutdown..."
+
+      #  Final state backup before shutdown 
+      # Same script the keepalive loop uses every 5 min. Runs even if an
+      # earlier step failed (if: always()), so the cache always receives the
+      # freshest possible archive at shutdown. Crash-safe: the previous
+      # archive is never deleted before the new one is fully written.
+      - name:  Final state backup before shutdown
+        id: final-snapshot
+        # always() so a cancelled run / job timeout still takes the snapshot that
+        # the cache-save step below depends on (a custom if: without always() is
+        # skipped on cancellation, which silently threw the whole session away).
+        if: ${{ always() && steps.keepalive.outcome != 'skipped' }}
+        env:
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+          export FORCE_PUSH=1
+          # CRITICAL: snapshot-state.sh authenticates to Redis before it writes
+          # anything, and the stack's password is NOT necessarily the optional
+          # REDIS_PASSWORD secret — 'Super-fast startup' derives one from
+          # JWT_SECRET when that secret is unset. Passing an empty password made
+          # redis-cli answer NOAUTH, so this shutdown snapshot ALWAYS failed for
+          # such deployments and the cache save fell back to a stale marker.
+          # Resolve it exactly like the keepalive loop does: the secret if set,
+          # otherwise the value the containers actually booted with from .env.
+          REDIS_PASSWORD="${REDIS_PASSWORD:-$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')}"
+          export REDIS_PASSWORD
+          if bash utils/snapshot-state.sh; then
+            touch ./.snapshot-success
+          else
+            echo "::warning::the shutdown snapshot did not complete; the last complete on-disk archive will be verified instead"
+          fi
+
+          # ── Persistence verification ──────────────────────────────────────
+          # The cache key is unique per run and a cache entry can never be
+          # replaced, so whatever is saved here is what the NEXT session
+          # restores. Prove the archive is complete, newer than the last
+          # snapshot this session took, and no smaller than the archive this
+          # session started from — otherwise fail loudly and leave the previous
+          # cache entry as the next session's restore target.
+          ARCHIVE=./supabase-state.tar.gz
+          fail() {
+            echo "::error::$1"
+            echo "cache_ready=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+
+          # 1. Integrity: readable archive that still carries the database set.
+          [ -s "$ARCHIVE" ] || fail "no state archive on disk at shutdown - nothing to persist"
+          tar tzf "$ARCHIVE" >/dev/null 2>&1 || fail "state archive is not a readable tar.gz"
+          tar tzf "$ARCHIVE" 2>/dev/null | grep -qx 'db-backups/manifest.tsv' \
+            || fail "state archive contains no database manifest (db-backups/manifest.tsv)"
+
+          ARCHIVE_BYTES=$(wc -c < "$ARCHIVE" | tr -d ' \n')
+          ARCHIVE_TS=$(tar xzf "$ARCHIVE" -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+
+          # 2. Freshness: snapshot-state.sh writes ./state-ts BEFORE it packs and
+          #    publishes the archive atomically, so on success the two agree. A
+          #    newer ./state-ts means the pack or the mv failed and the archive on
+          #    disk is stale - exactly the case that used to be saved silently.
+          LAST_SNAP_TS=$(cat ./state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+          if [ -n "${ARCHIVE_TS:-}" ] && [ -n "${LAST_SNAP_TS:-}" ] \
+             && [ "$ARCHIVE_TS" -lt "$LAST_SNAP_TS" ]; then
+            fail "archive is OLDER than the last snapshot (archive state-ts $ARCHIVE_TS < last snapshot $LAST_SNAP_TS) - a snapshot failed and left a stale file"
+          fi
+
+          # 3. Growth: compare against what this session restored (.state-baseline,
+          #    written by 'Restore full state'). A shrink means a truncated dump.
+          BASELINE_BYTES=0
+          BASELINE_TS=""
+          if [ -f ./.state-baseline ]; then
+            BASELINE_BYTES=$(sed -n 's/^size=\([0-9][0-9]*\)$/\1/p' ./.state-baseline | head -1)
+            BASELINE_TS=$(sed -n 's/^ts=\([0-9][0-9]*\)$/\1/p' ./.state-baseline | head -1)
+          fi
+          BASELINE_BYTES=${BASELINE_BYTES:-0}
+
+          if [ "$BASELINE_BYTES" -gt 0 ] && [ "$ARCHIVE_BYTES" -lt "$BASELINE_BYTES" ]; then
+            fail "archive SHRANK from $BASELINE_BYTES to $ARCHIVE_BYTES bytes - a database dump is probably truncated; refusing to overwrite good state"
+          fi
+          if [ -n "${BASELINE_TS:-}" ] && [ -n "${ARCHIVE_TS:-}" ] \
+             && [ "$ARCHIVE_TS" -lt "$BASELINE_TS" ]; then
+            fail "archive is OLDER than the one it replaces (archive state-ts $ARCHIVE_TS < restored state-ts $BASELINE_TS)"
+          fi
+
+          echo "  persisted state verified:"
+          echo "    archive bytes:    $ARCHIVE_BYTES (restored baseline: ${BASELINE_BYTES:-0})"
+          echo "    archive state-ts: ${ARCHIVE_TS:-unknown}"
+          echo "    last snapshot ts: ${LAST_SNAP_TS:-unknown}"
+          echo "    restored ts:      ${BASELINE_TS:-fresh start}"
+          echo "cache_ready=true" >> "$GITHUB_OUTPUT"
+
+      #  Stop services 
+      - name:  Stop Supabase services
+        if: always()
+        run: |
+          cd "$SUPABASE_DIR"
+          docker compose down 2>/dev/null || true
+          echo "All services stopped"
+
+      #  Save full state archive to cache 
+      # The keepalive loop writes on-disk snapshots every 5 minutes; this step
+      # persists the freshest one to the Actions cache at the end of the run.
+      # Only runs if NOT cancelled and a valid state archive exists on disk.
+      - name:  Save final state to GitHub Actions cache
+        id: cache-save
+        # always(): a cancelled run or the 355-min job timeout must still persist
+        # the freshest archive, otherwise an operator 'restart' loses everything.
+        if: ${{ always() && steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.gz') != '' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.BACKUP_FILE }}
+          key: supabase-db-live-${{ github.run_id }}-${{ github.run_attempt }}-final
+
+      #  Prove the archive actually landed in the cache 
+      # The save step reports success as soon as the upload is accepted, and a
+      # skipped save fails nothing at all. This closes the loop: the freshness and
+      # growth checks above ran against the local FILE, this confirms the stored
+      # ENTRY that the next session will restore.
+      - name:  Verify the archive reached the Actions cache
+        id: cache-verify
+        if: ${{ always() && steps.cache-save.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          KEY="supabase-db-live-${{ github.run_id }}-${{ github.run_attempt }}-final"
+          # size_in_bytes is the compressed size of the stored entry, not the raw
+          # file size, so only existence and non-emptiness are asserted here.
+          for attempt in $(seq 1 12); do
+            SIZE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/caches?key=${KEY}" \
+              | python3 -c 'import json,sys;k=sys.argv[1];d=json.load(sys.stdin);print(next((int(c.get("size_in_bytes") or 0) for c in d.get("actions_caches",[]) if c.get("key")==k),0))' "$KEY" 2>/dev/null || true)
+            if [ -n "${SIZE:-}" ] && [ "${SIZE:-0}" -gt 0 ] 2>/dev/null; then
+              echo "cache entry verified: ${KEY} (${SIZE} bytes stored)"
+              exit 0
+            fi
+            echo "  cache entry not visible yet (attempt ${attempt}/12) - retrying in 5s"
+            sleep 5
+          done
+          echo "::error::state archive was NOT found in the Actions cache as '${KEY}' - this session's data would be lost on the next run"
+          exit 1
+
+      #  Summary 
+      - name:  Log session summary
+        if: always()
+        env:
+          TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DOMAIN="${TUNNEL_DOMAIN:-}"
+          echo ""
+          echo "+=============================================================+"
+          echo "|  SESSION COMPLETE                                           |"
+          echo "+=============================================================+"
+          if [ -f ${{ env.BACKUP_FILE }} ]; then
+            SIZE=$(du -h ${{ env.BACKUP_FILE }} | cut -f1)
+            echo "|  Database backed up ($SIZE)                                |"
+          fi
+          echo "|  Next run: managed by Cloudflare Worker (node-watchman)      |"
+          if [ -n "$TUNNEL_DOMAIN" ]; then
+            echo "|  https://$DOMAIN                                              |"
+            echo "|  Redis API: https://$DOMAIN/functions/v1/redis-http          |"
+            echo "|  Badge: https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
+          else
+            echo "::warning::Permanent public Redis URL unavailable because CF_TUNNEL_DOMAIN is not configured"
+          fi
+          echo "|  Monitor: https://github.com/${{ github.repository }}/actions    |"
+          echo "+=============================================================+"
+          echo ""
+          # Cache usage vs GitHub's 10GB per-repo limit (best-effort report)
+          USAGE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/caches" 2>/dev/null | \
+            python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"{d.get(\"total_size_bytes\",0)/1024/1024/1024:.2f} GB across {d.get(\"total_count\",0)} cache entries (limit 10 GB)")' 2>/dev/null || echo "unknown")
+          echo "    GitHub cache usage: $USAGE"

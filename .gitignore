@@ -1,0 +1,72 @@
+# Supabase local environment (contains secrets!)
+.env
+/supabase/.env
+
+# Remote control credentials for ./remote.sh (contains the service_role key!)
+/remote.env
+
+# Generated OpenDrive infrastructure credentials (Postgres/JWT/Redis passwords
+# and the anon + service_role keys). These belong in GitHub Actions secrets,
+# never in a repository — least of all a public one.
+/opendrive-infra-credentials.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker volumes (large, generated at runtime)
+/volumes/
+/supabase/volumes/db/data/
+/supabase/volumes/storage/
+/supabase/volumes/redis/data/
+/supabase/volumes/snippets/
+/supabase/volumes/functions/*
+# The logs, cache and migrate edge functions ship with the repo
+!/supabase/volumes/functions/logs/
+!/supabase/volumes/functions/logs/*
+!/supabase/volumes/functions/cache/
+!/supabase/volumes/functions/cache/*
+!/supabase/volumes/functions/migrate/
+!/supabase/volumes/functions/migrate/*
+!/supabase/volumes/functions/health/
+!/supabase/volumes/functions/health/*
+!/supabase/volumes/functions/redis-http/
+!/supabase/volumes/functions/redis-http/*
+
+# State archives (database dumps — contain data, never commit)
+/supabase/*.dump
+/supabase/*.dump.*
+/supabase/dump.rdb
+/supabase/dump.rdb.new
+/supabase/appendonlydir/
+/supabase/appendonlydir.new/
+/supabase/db-backups/
+/supabase/db-backups.new.*/
+/supabase/db-backups.previous/
+/supabase/.state-settings.env*
+# What this session restored, so the shutdown step can prove the archive it
+# saves is not older or smaller than its own input (see the workflow).
+/supabase/.state-baseline
+/supabase/postgresql.auto.conf*
+# Redis AOF (multi-part appendonly dir) captured by snapshot-state.sh
+/supabase/pgsodium_root.key
+/supabase/supabase-state.tar.gz
+/supabase/supabase-state.tar.gz.new
+/supabase/.cf_push_last
+
+# Rotated Cloudflare OAuth refresh token (SECRET — archived with the state so
+# the off-site backup chain survives restarts; never commit it) and the
+# snapshot timestamp packed into the state archive for freshness comparison.
+/supabase/.cf-creds
+/supabase/state-ts
+# Transient files used by the restore step's off-site recovery paths
+/supabase/supabase-state.tar.gz.kv
+/supabase/supabase-state.tar.gz.offsite
+
+# Cloned/test directories (old troubleshooting copies)
+/tmp-supabase/
+node_modules/
+derive-key.cjs
+package.json
+package-lock.json
+job_log.txt
