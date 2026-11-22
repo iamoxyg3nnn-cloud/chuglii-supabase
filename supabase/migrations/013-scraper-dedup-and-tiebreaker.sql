@@ -6,6 +6,8 @@
 WITH ranked_videos AS (
     SELECT 
         id,
+        full_video_url,
+        duration_seconds,
         ROW_NUMBER() OVER (
             PARTITION BY full_video_url
             ORDER BY 
