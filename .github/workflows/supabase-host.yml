@@ -1243,6 +1243,7 @@ jobs:
                   # (needs CREATEDB) and --disable-triggers needs superuser.
                   docker compose exec -T db pg_restore -U supabase_admin \
                     --clean --if-exists --create --disable-triggers --exit-on-error --jobs 4 \
+                    -L "/mnt/host/.restore-toc.$DB_INDEX" \
                     -d template1 "/mnt/host/db-backups/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                   if [ "$RESTORE_STATUS" -ne 0 ]; then
                     echo "::error::PostgreSQL restore failed for $DB_NAME:"
