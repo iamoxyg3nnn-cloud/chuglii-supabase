@@ -67,6 +67,14 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
   fi
   DB_DUMP_NAME="$(printf 'db-%08d.d' "$DB_INDEX")"
   echo "  🗄️  dumping database: $DB_NAME"
+  # Purge analytics log tables first: they are ephemeral Kong access-log
+  # noise (millions of rows — the bulk of the archive), they grow every
+  # minute, and a single malformed JSON row aborts the whole pg_restore COPY
+  # on the next session. Truncating keeps dumps tiny and restores reliable.
+  docker compose exec -T db psql -U supabase_admin -d "$DB_NAME" -q \
+    -c "DO \$\$ DECLARE t text; BEGIN FOR t IN SELECT schemaname||'.'||tablename FROM pg_tables WHERE tablename LIKE 'log_events%' LOOP EXECUTE 'TRUNCATE '||t; END LOOP; END \$\$;" \
+    </dev/null >/dev/null 2>&1 || true
+  touch ./.log-purge-active
   # Dump straight onto runner disk through the /mnt/host bind mount — no
   # docker cp back (that copy cost ~55s per snapshot on a 600MB dump). The
   # staging dir lives under the workspace, so the container sees it at

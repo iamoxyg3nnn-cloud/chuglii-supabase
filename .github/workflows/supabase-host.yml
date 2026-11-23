@@ -1161,6 +1161,14 @@ jobs:
                 echo "Restoring database: $DB_NAME"
                 # Reads the dump straight through the /mnt/host bind mount —
                 # zero docker cp.
+                # Exclude analytics log tables from the restore: ephemeral
+                # Kong access-log noise, and one malformed JSON row aborts the
+                # entire COPY (this exact failure broke a session restore).
+                # Schema still restores; only the noise rows are skipped.
+                TOC_FILE="./.restore-toc.$DB_INDEX"
+                docker compose exec -T db pg_restore -U postgres \
+                  --list "/mnt/host/db-backups/$DB_DUMP_NAME" </dev/null 2>/dev/null \
+                  | grep -v 'TABLE DATA log_events' > "$TOC_FILE" || true
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
                 if [ "$DB_NAME" = "postgres" ]; then
@@ -1196,12 +1204,13 @@ jobs:
                   rm -f "$CLEAN_LOG"
 
                   # Replay database-level GUCs (ALTER DATABASE ... SET) from the archive
-                  docker compose exec -T db pg_restore -C -f - "/mnt/host/db-backups/$DB_DUMP_NAME" 2>/dev/null \
+                  docker compose exec -T db pg_restore -C -f - -L "/mnt/host/.restore-toc.$DB_INDEX" "/mnt/host/db-backups/$DB_DUMP_NAME" 2>/dev/null \
                     | grep -E '^ALTER DATABASE [^ ]+ SET ' \
                     | docker compose exec -T db psql -U supabase_admin -d postgres >/dev/null 2>&1 || true
 
                   docker compose exec -T db pg_restore -U supabase_admin \
                     --clean --if-exists --disable-triggers --exit-on-error --jobs 4 \
+                    -L "/mnt/host/.restore-toc.$DB_INDEX" \
                     -d postgres "/mnt/host/db-backups/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                   if [ "$RESTORE_STATUS" -ne 0 ]; then
                     echo "::error::PostgreSQL restore failed for postgres:"
@@ -1243,7 +1252,7 @@ jobs:
                     RESTORE_FAILED=1
                   fi
                 fi
-                rm -f "$RESTORE_LOG"
+                rm -f "$RESTORE_LOG" "$TOC_FILE"
                 if [ "$RESTORE_FAILED" -ne 0 ]; then
                   break
                 fi
@@ -1900,7 +1909,11 @@ jobs:
           fi
           BASELINE_BYTES=${BASELINE_BYTES:-0}
 
-          if [ "$BASELINE_BYTES" -gt 0 ] && [ "$ARCHIVE_BYTES" -lt "$BASELINE_BYTES" ]; then
+          # The analytics log purge (snapshot-state.sh truncates log_events
+          # before dumping) legitimately shrinks the archive by hundreds of
+          # MB, so the byte-growth guard only applies when this session did
+          # NOT purge. Freshness (state-ts) checks still always apply.
+          if [ ! -f ./.log-purge-active ] && [ "$BASELINE_BYTES" -gt 0 ] && [ "$ARCHIVE_BYTES" -lt "$BASELINE_BYTES" ]; then
             fail "archive SHRANK from $BASELINE_BYTES to $ARCHIVE_BYTES bytes - a database dump is probably truncated; refusing to overwrite good state"
           fi
           if [ -n "${BASELINE_TS:-}" ] && [ -n "${ARCHIVE_TS:-}" ] \
