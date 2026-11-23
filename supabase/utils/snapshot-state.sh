@@ -91,6 +91,10 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
     rm -rf "$DB_STAGING"
     exit 1
   fi
+  # pg_dump (container's postgres user) creates the dump dir with 0700 —
+  # unreadable by the runner-side tar that packs the archive AND by the
+  # container-side pg_restore after the next session extracts it. Relax it.
+  docker compose exec -T db chmod -R a+rX "$STAGING_IN_CONTAINER/$DB_DUMP_NAME" </dev/null >/dev/null 2>&1 || true
   printf '%s\t%s\t%s\n' "$DB_DUMP_NAME" "$DB_NAME_B64" "$DB_OWNER_B64" >> "$DB_STAGING/manifest.tsv"
 done
 
