@@ -585,13 +585,21 @@ restore_once() {
     return 1
   fi
 
-  for ((i = 0; i < parts; i++)); do
-    nn="$(printf "%0${suffix_width}d" "$i")"
-    if ! get_value "$prefix/$base.$nn" "$tmp/part.$nn"; then
-      echo "  ⚠️  chunk $prefix/$base.$nn missing or unreadable"
-      rm -rf "$tmp"
-      return 1
-    fi
+  for ((i = 0; i < parts; i += 6)); do
+    end=$((i + 6)); [ "$end" -gt "$parts" ] && end=$parts
+    for ((j = i; j < end; j++)); do
+      nn="$(printf "%0${suffix_width}d" "$j")"
+      get_value "$prefix/$base.$nn" "$tmp/part.$nn" &
+    done
+    wait
+    for ((j = i; j < end; j++)); do
+      nn="$(printf "%0${suffix_width}d" "$j")"
+      if [ ! -s "$tmp/part.$nn" ]; then
+        echo "  ⚠️  chunk $prefix/$base.$nn missing or unreadable"
+        rm -rf "$tmp"
+        return 1
+      fi
+    done
   done
   : > "$tmp/archive"
   for ((i = 0; i < parts; i++)); do

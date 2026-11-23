@@ -881,6 +881,16 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
+              # Restore-mode WAL tuning: with wal_level=minimal, COPY into
+              # newly-created tables skips WAL entirely — a major pg_restore
+              # speedup. Requires a RESTART (the one below applies it).
+              # max_wal_senders/slots MUST be 0 with minimal or Postgres
+              # refuses to start. Reverted + restarted after the restore.
+              docker compose exec -T db psql -U supabase_admin -d postgres -q \
+                -c "ALTER SYSTEM SET wal_level = minimal;" \
+                -c "ALTER SYSTEM SET max_wal_senders = 0;" \
+                -c "ALTER SYSTEM SET max_replication_slots = 0;" >/dev/null 2>&1 \
+                || echo "  ⚠️  could not apply WAL restore-mode tuning"
               if ! docker compose restart db >/dev/null; then
                 echo "::error::PostgreSQL could not restart with the saved settings"
                 echo 1 > "$STATUS_FILE"
@@ -1088,10 +1098,15 @@ jobs:
                   break
                 fi
                 echo "Restoring database: $DB_NAME"
-                if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME" </dev/null; then
-                  echo "::error::failed to copy database dump: $DB_DUMP_NAME"
-                  RESTORE_FAILED=1
-                  break
+                # The preflight pass already staged this dump into the container
+                # (and validated it). Reuse it — copying every dump twice was
+                # pure wasted I/O on a ~600MB+ archive.
+                if ! docker compose exec -T db sh -c "test -e '/tmp/$DB_DUMP_NAME'" </dev/null 2>/dev/null; then
+                  if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME" </dev/null; then
+                    echo "::error::failed to copy database dump: $DB_DUMP_NAME"
+                    RESTORE_FAILED=1
+                    break
+                  fi
                 fi
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
@@ -1251,14 +1266,29 @@ jobs:
             # ── Revert restore-mode tuning BEFORE anything snapshots auto.conf ──
             # fsync=off must never survive into postgresql.auto.conf (which
             # snapshot-state.sh archives) or the next session boots non-durable.
+            # wal_level needs a RESTART (not just a reload) to return to logical
+            # — done here so app services start against the normal config.
             docker compose exec -T db psql -U supabase_admin -d postgres -q \
               -c "ALTER SYSTEM RESET fsync;" \
               -c "ALTER SYSTEM RESET synchronous_commit;" \
               -c "ALTER SYSTEM RESET full_page_writes;" \
               -c "ALTER SYSTEM RESET max_wal_size;" \
               -c "ALTER SYSTEM RESET maintenance_work_mem;" \
+              -c "ALTER SYSTEM RESET wal_level;" \
+              -c "ALTER SYSTEM RESET max_wal_senders;" \
+              -c "ALTER SYSTEM RESET max_replication_slots;" \
               -c "SELECT pg_reload_conf();" \
               -c "CHECKPOINT;" >/dev/null 2>&1 || true
+            # Clean staged dumps out of the container: a leftover
+            # /tmp/db-00000001.d makes the FIRST snapshot's pg_dump fail with
+            # "File exists" and kills every snapshot for the whole session.
+            docker compose exec -T db sh -c \
+              'rm -rf /tmp/db-[0-9]*.d /tmp/db-[0-9]*.dump /tmp/backup.dump' </dev/null 2>/dev/null || true
+            docker compose restart db >/dev/null 2>&1 || true
+            for i in $(seq 1 30); do
+              docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1 && break
+              sleep 2
+            done
 
             #  Verify restore success 
             echo "Verifying restore..."
@@ -1726,13 +1756,18 @@ jobs:
           export REDIS_PASSWORD
           # Belt-and-braces: make sure restore-mode tuning is reverted even if
           # the restore step failed midway, before this snapshot captures
-          # postgresql.auto.conf.
+          # postgresql.auto.conf. wal_level edits land in auto.conf even though
+          # the running server needs a restart to pick them up — the archive
+          # must be clean, and the session is ending anyway.
           docker compose exec -T db psql -U supabase_admin -d postgres -q \
             -c "ALTER SYSTEM RESET fsync;" \
             -c "ALTER SYSTEM RESET synchronous_commit;" \
             -c "ALTER SYSTEM RESET full_page_writes;" \
             -c "ALTER SYSTEM RESET max_wal_size;" \
             -c "ALTER SYSTEM RESET maintenance_work_mem;" \
+            -c "ALTER SYSTEM RESET wal_level;" \
+            -c "ALTER SYSTEM RESET max_wal_senders;" \
+            -c "ALTER SYSTEM RESET max_replication_slots;" \
             -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
           if bash utils/snapshot-state.sh; then
             touch ./.snapshot-success

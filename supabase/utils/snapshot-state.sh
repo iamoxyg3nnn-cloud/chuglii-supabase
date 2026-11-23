@@ -64,6 +64,10 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
   fi
   DB_DUMP_NAME="$(printf 'db-%08d.d' "$DB_INDEX")"
   echo "  🗄️  dumping database: $DB_NAME"
+  # The restore phase stages dumps at the same /tmp paths inside the container;
+  # a leftover directory makes pg_dump -f fail with "File exists" and KILLS
+  # every snapshot for the rest of the session (data-loss risk). Clean first.
+  docker compose exec -T db rm -rf "/tmp/$DB_DUMP_NAME" </dev/null 2>/dev/null || true
   # Directory format + --jobs=4: the only pg_dump format that can dump in
   # parallel (custom format is single-threaded). --compress=0: the outer zstd
   # tar compresses once — double compression was ~3x slower for no real gain.
