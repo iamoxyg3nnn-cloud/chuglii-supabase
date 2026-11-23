@@ -9,7 +9,12 @@
 # Config (read from supabase/.env, or from the environment):
 #   HF_TOKEN   - Hugging Face User Access Token (with Write permission)
 #   HF_REPO    - Target private dataset (e.g. "username/supabase-backup-vault")
-#   HF_RETENTION_DAYS - Days to keep historical backups (default: 7)
+#   HF_RETENTION_DAYS - Days to keep historical backups (default: 1)
+#   HF_MAX_HISTORY    - Max number of dated history snapshots to keep,
+#                       regardless of age (default: 12). Each snapshot is
+#                       ~600 MB; free-tier private LFS storage is limited,
+#                       so unbounded retention fills the quota and makes
+#                       every subsequent upload fail.
 #
 # Usage:
 #   huggingface-backup.sh push <file>            # upload latest + dated snapshot, prune > 7d
@@ -72,6 +77,10 @@ cmd_push() {
   fi
 
   ensure_hf_hub || return 1
+
+  # Prune BEFORE pushing: free-tier private LFS storage is small, and old
+  # snapshots must be deleted first or the new upload is rejected for quota.
+  cmd_prune
 
   echo "  🤗 pushing backup to Hugging Face Private Dataset ($HF_REPO)..."
   python3 -c '
@@ -194,7 +203,6 @@ finally:
 print(f"  ✅ Hugging Face backup successful: {hist_path} (SHA: {sha[:16]}...)")
 ' "$file" || return 1
 
-  cmd_prune
   return 0
 }
 
@@ -258,7 +266,8 @@ from huggingface_hub import HfApi
 
 token = os.environ["HF_TOKEN"]
 repo_id = os.environ["HF_REPO"]
-retention_days = int(os.environ.get("HF_RETENTION_DAYS", "7"))
+retention_days = int(os.environ.get("HF_RETENTION_DAYS", "1"))
+max_history = int(os.environ.get("HF_MAX_HISTORY", "12"))
 now = time.time()
 max_age_secs = retention_days * 86400
 
@@ -288,23 +297,39 @@ for hf in hist_files:
 
 parsed.sort(key=lambda x: x[0])
 
-# Keep at least the newest one
+# Keep at least the newest one; delete by age AND by count cap.
 to_delete = []
 for ts, path in parsed[:-1]:
     age = now - ts
     if age > max_age_secs:
         to_delete.append(path)
 
+# Count cap: even fresh snapshots must go if there are too many (each is
+# ~600 MB and free-tier storage is limited). Always keep the newest one.
+kept = [p for _, p in parsed if p not in to_delete]
+if len(kept) > max_history:
+    to_delete.extend(kept[:-max_history])
+
+to_delete = sorted(set(to_delete))
+
 if to_delete:
-    print(f"  🧹 Pruning {len(to_delete)} expired backup(s) (> {retention_days}d) from Hugging Face...")
-    for p in to_delete:
+    print(f"  🧹 Pruning {len(to_delete)} backup(s) (> {retention_days}d or beyond the {max_history}-snapshot cap) from Hugging Face...")
+    for i in range(0, len(to_delete), 50):
+        batch = to_delete[i:i+50]
         try:
-            api.delete_file(path_in_repo=p, repo_id=repo_id, repo_type="dataset", commit_message=f"Prune expired backup {p}")
-            print(f"    - deleted {p}")
+            api.delete_files(repo_id=repo_id, repo_type="dataset", delete_patterns=batch, commit_message="Prune old backups (retention/count cap)")
+            for p in batch:
+                print(f"    - deleted {p}")
         except Exception as e:
-            print(f"    ⚠️ failed to delete {p}: {e}")
+            print(f"    ⚠️ failed to delete batch: {e}")
+            for p in batch:
+                try:
+                    api.delete_file(path_in_repo=p, repo_id=repo_id, repo_type="dataset", commit_message=f"Prune expired backup {p}")
+                    print(f"    - deleted {p}")
+                except Exception as e2:
+                    print(f"    ⚠️ failed to delete {p}: {e2}")
 else:
-    print(f"  ✅ Hugging Face retention healthy ({len(hist_files)} backups within {retention_days} days).")
+    print(f"  ✅ Hugging Face retention healthy ({len(hist_files)} backups within {retention_days}d / {max_history} cap).")
 ' || true
 }
 
