@@ -15,7 +15,7 @@ jobs:
           mkdir -p /tmp/x && cd /tmp/x
           tar -xf /tmp/a.tar.zst db-backups
           ls -la db-backups | head
-          docker run --rm -v /tmp/x/db-backups:/d:ro postgres:17.6.1.136 pg_restore --list /d/db-00000001.d > /tmp/toc.txt || echo "pg_restore --list exited $? (output still usable)"
+          docker run --rm -v /tmp/x/db-backups:/d:ro supabase/postgres:17.6.1.136 pg_restore --list /d/db-00000001.d > /tmp/toc.txt || echo "pg_restore --list exited $? (output still usable)"
           echo "=== total lines: $(wc -l < /tmp/toc.txt)"
           echo "=== lines containing log_events:"
           grep -n 'log_events' /tmp/toc.txt | head -15
