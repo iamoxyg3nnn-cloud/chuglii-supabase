@@ -1,0 +1,42 @@
+name: HF token check
+on: workflow_dispatch
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate HF_TOKEN against huggingface.co
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO }}
+        run: |
+          pip install -q huggingface_hub
+          python3 - <<'PY'
+          import os, json
+          from huggingface_hub import HfApi
+          tok = os.environ["HF_TOKEN"]
+          repo = os.environ["HF_REPO"]
+          api = HfApi(token=tok)
+          try:
+              who = api.whoami()
+              print("whoami OK")
+              print("  name:", who.get("name"))
+              print("  auth type:", who.get("auth", {}).get("type"))
+              print("  accessToken role:", who.get("auth", {}).get("accessToken", {}).get("role"))
+              print("  fineGrained scopes:", json.dumps(who.get("auth", {}).get("accessToken", {}).get("fineGrained", {})))
+          except Exception as e:
+              print("whoami FAILED:", repr(e))
+              resp = getattr(e, "response", None)
+              if resp is not None:
+                  print("  HTTP", resp.status_code, resp.text[:500])
+          try:
+              info = api.repo_info(repo_id=repo, repo_type="dataset")
+              print("dataset repo accessible:", info.id, "private:", info.private)
+          except Exception as e:
+              print("repo access FAILED:", repr(e))
+              resp = getattr(e, "response", None)
+              if resp is not None:
+                  print("  HTTP", resp.status_code, resp.text[:500])
+          PY
+          echo "--- whoami without token (quota context) ---"
+          curl -s https://huggingface.co/api/datasets/$HF_REPO | head -c 300; echo
