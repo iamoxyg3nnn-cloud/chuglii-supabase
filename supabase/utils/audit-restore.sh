@@ -177,7 +177,7 @@ echo "=============================================================="
 
 # ── drift guard: the dump flags this audit exercises must still be the ones
 #    snapshot-state.sh uses, or the audit would be testing a fiction.
-for needle in '--format=custom --compress=6 --create' 'pg_dumpall' 'pg_restore --list'; do
+for needle in '--format=custom --compress=0 --create' 'pg_dumpall' 'pg_restore --list'; do
   grep -qF -- "$needle" "$SNAPSHOT_SH" \
     || die "snapshot-state.sh no longer contains '$needle' — this audit would test the wrong dump"
 done
@@ -338,7 +338,7 @@ while IFS='|' read -r N O; do
   # stdin when the child doesn't read it, which consumed the enclosing
   # read-loop's file — the first CI docker run failed with exactly this and
   # only snapshotted the first database in the list.
-  pq 1 pg_dump -U postgres --format=custom --compress=6 --create --dbname="$N" \
+  pq 1 pg_dump -U postgres --format=custom --compress=0 --create --dbname="$N" \
     </dev/null > "$WORK/db-backups/$F" 2>/dev/null \
     || { fail "pg_dump failed for $N"; exit 1; }
   pq 1 pg_restore -U postgres --list < "$WORK/db-backups/$F" >/dev/null 2>&1 \
