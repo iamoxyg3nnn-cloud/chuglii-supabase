@@ -369,7 +369,7 @@ pack_archive() {
 pack_archive || exit 1
 
 # ── 6. Off-site mirror to Cloudflare KV (realtime / fast-sync) ────────
-PUSH_INTERVAL="${CF_PUSH_INTERVAL:-3600}"
+PUSH_INTERVAL="${CF_PUSH_INTERVAL:-600}"
 CF_MARKER=./.cf_push_last
 CF_SHA_MARKER=./.cf_push_sha
 CF_QUOTA_FILE=./.cf_quota_exhausted
@@ -470,7 +470,12 @@ if [ -s ./supabase-state.tar.zst ] && [ -n "$GH_AUTH_TOKEN" ]; then
 fi
 
 # ── 8. Real-time mid-job save to GitHub Actions Cache ──────────────────
-if [ -s ./supabase-state.tar.zst ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+# Throttled to every 3rd snapshot (~90s): each save uploads the archive to
+# the cache service, and only the newest entry is ever restored. The save
+# uses the EXACT BACKUP_FILE path string so the version hash matches
+# actions/cache/restore@v6 — see save-actions-cache.cjs.
+if [ -s ./supabase-state.tar.zst ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] \
+   && [ "$(( ${SLOT:-0} % 3 ))" -eq 0 ]; then
   echo "  💾 pushing real-time snapshot to GitHub Actions Cache..."
   node utils/save-actions-cache.cjs ./supabase-state.tar.zst 2>&1 || true
 fi

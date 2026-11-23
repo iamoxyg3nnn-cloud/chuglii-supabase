@@ -1690,12 +1690,16 @@ jobs:
           while [ $(date +%s) -lt $END_TIME ]; do
             NOW=$(date +%s)
 
-            # Realtime full-state snapshot every 60 seconds (1 minute):
+            # Realtime full-state snapshot every 30 seconds:
             # Dumps DB + keys + functions + Redis, and immediately syncs to
-            # Cloudflare KV and GitHub Release (live-backup).
+            # Cloudflare KV and GitHub Release (live-backup). With the
+            # analytics log purge the archive is ~20MB, so a 30s cadence is
+            # cheap — the data-loss window on an abnormal death drops to ~30s
+            # (the mid-run slot cache saves are restorable by the restore
+            # action now that the version-hash path matches).
             if [ "$NOW" -ge "$NEXT_SNAP" ]; then
               echo ""
-              echo " [$(date '+%H:%M:%S')] Realtime Snapshot #$SLOT (every 60s)..."
+              echo " [$(date '+%H:%M:%S')] Realtime Snapshot #$SLOT (every 30s)..."
               export SLOT
               if bash utils/snapshot-state.sh; then
                 touch ./.snapshot-success
@@ -1703,7 +1707,7 @@ jobs:
               else
                 echo "    snapshot failed; previous archive preserved and this tick will not count as success"
               fi
-              NEXT_SNAP=$((NOW + 60))
+              NEXT_SNAP=$((NOW + 30))
               SLOT=$((SLOT + 1))
               # Prune old cache entries & expired KV backups every 15 snapshots (~15 min)
               if [ $(( SLOT % 15 )) -eq 0 ]; then

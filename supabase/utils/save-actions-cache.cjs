@@ -65,6 +65,15 @@ async function main() {
   const repoRoot = path.resolve(__dirname, '..', '..');
   const relativePath = path.relative(repoRoot, path.resolve(archivePath)).replace(/\\/g, '/');
 
+  // ── CRITICAL: version-hash compatibility with actions/cache/restore ──
+  // The cache version hash is computed from the path STRING exactly as given
+  // (getCacheVersion uses `paths`, not the resolved cachePaths). The restore
+  // action uses `path: ${{ env.BACKUP_FILE }}` (e.g. './supabase/supabase-state.tar.zst').
+  // We must pass the EXACT same string or the version hash differs and the
+  // restore action can never find entries saved here — which is exactly why
+  // every mid-run slot save was invisible to the restore step until now.
+  const versionPath = process.env.BACKUP_FILE || relativePath;
+
   const archiveStat = fs.statSync(archivePath);
   const sizeMb = (archiveStat.size / (1024 * 1024)).toFixed(2);
   console.log(`[actions-cache] 🚀 Uploading real-time cache entry (${sizeMb} MB) with key: ${key}...`);
@@ -72,7 +81,7 @@ async function main() {
   try {
     const cwd = process.cwd();
     process.chdir(repoRoot);
-    const cacheId = await cache.saveCache([relativePath], key);
+    const cacheId = await cache.saveCache([versionPath], key);
     process.chdir(cwd);
     if (cacheId && cacheId !== -1) {
       console.log(`[actions-cache] ✅ Real-time cache committed to GitHub Actions! (Cache ID: ${cacheId}, key: ${key})`);
