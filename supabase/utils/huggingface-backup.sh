@@ -85,26 +85,68 @@ retention_days = int(os.environ.get("HF_RETENTION_DAYS", "7"))
 
 api = HfApi(token=token)
 
+def _err_details(e):
+    """Return a full description of an huggingface_hub HTTP error.
+
+    The bare exception str() is often just a Request ID with no status or
+    body, which makes the failure impossible to diagnose from the logs.
+    """
+    parts = [repr(e)]
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            parts.append(f"HTTP {resp.status_code}")
+            body = resp.text
+            if body:
+                parts.append(f"body: {body[:2000]}")
+        except Exception:
+            pass
+    return " | ".join(parts)
+
+
+def _upload_with_retry(api, *, path_or_fileobj, path_in_repo, repo_id, repo_type, commit_message, attempts=4):
+    """Upload with exponential backoff (2s/8s/32s). Transient 429/5xx and
+    Xet/LFS hiccups are common on large (~600 MB) uploads; retry those."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            api.upload_file(
+                path_or_fileobj=path_or_fileobj,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                commit_message=commit_message,
+            )
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < attempts:
+                wait = 2 ** (2 * attempt - 1)  # 2s, 8s, 32s
+                print(f"  ⚠️  upload attempt {attempt}/{attempts} failed: {_err_details(e)}", file=sys.stderr)
+                print(f"      retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+    print(f"  ERROR uploading {path_in_repo} to Hugging Face after {attempts} attempts: {_err_details(last_err)}", file=sys.stderr)
+    return False
+
+
 # 1. Ensure private dataset repository exists
 try:
     api.create_repo(repo_id=repo_id, repo_type="dataset", private=True, exist_ok=True)
 except Exception as e:
-    print(f"  ERROR creating/accessing Hugging Face repo {repo_id}: {e}", file=sys.stderr)
+    print(f"  ERROR creating/accessing Hugging Face repo {repo_id}: {_err_details(e)}", file=sys.stderr)
     sys.exit(1)
 
 # 2. Upload latest backup (overwrites latest pointer)
 size_mb = os.path.getsize(file_path) / (1024 * 1024)
 print(f"  Uploading latest/supabase-state.tar.gz ({size_mb:.1f} MB)...")
-try:
-    api.upload_file(
-        path_or_fileobj=file_path,
-        path_in_repo="latest/supabase-state.tar.gz",
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=f"Update latest backup ({size_mb:.1f} MB)"
-    )
-except Exception as e:
-    print(f"  ERROR uploading latest to Hugging Face: {e}", file=sys.stderr)
+if not _upload_with_retry(
+    api,
+    path_or_fileobj=file_path,
+    path_in_repo="latest/supabase-state.tar.gz",
+    repo_id=repo_id,
+    repo_type="dataset",
+    commit_message=f"Update latest backup ({size_mb:.1f} MB)",
+):
     sys.exit(1)
 
 # 3. Upload dated historical snapshot
@@ -112,16 +154,14 @@ now_dt = datetime.datetime.now(datetime.timezone.utc)
 date_str = now_dt.strftime("%Y-%m-%d-%H%M%S")
 hist_path = f"history/supabase-state-{date_str}.tar.gz"
 print(f"  Archiving {hist_path}...")
-try:
-    api.upload_file(
-        path_or_fileobj=file_path,
-        path_in_repo=hist_path,
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=f"Snapshot {date_str}"
-    )
-except Exception as e:
-    print(f"  ⚠️ Warning: dated archive failed: {e}", file=sys.stderr)
+_upload_with_retry(
+    api,
+    path_or_fileobj=file_path,
+    path_in_repo=hist_path,
+    repo_id=repo_id,
+    repo_type="dataset",
+    commit_message=f"Snapshot {date_str}",
+)
 
 # 4. Save manifest metadata
 import hashlib
