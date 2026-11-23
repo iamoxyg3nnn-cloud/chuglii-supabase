@@ -68,6 +68,14 @@ cmd_push() {
     echo "  ℹ️  Hugging Face backup SKIPPED — HF_TOKEN / HF_REPO not configured"
     return 0
   fi
+  # Free-tier private LFS storage is tiny (~a few GB at best). Once the quota
+  # is exhausted every push fails with HTTP 400 "Private storage limit
+  # reached" — retrying every 60s snapshot just burns ~45s of CPU per minute.
+  # Remember the exhaustion in a marker file and skip silently for the rest
+  # of the session (delete the marker or upgrade the HF plan to re-enable).
+  if [ -s "$BASE_DIR/.hf-storage-full" ]; then
+    return 0
+  fi
   [ -n "$file" ] || { echo "  ⚠️  usage: huggingface-backup.sh push <file>"; return 1; }
   [ -s "$file" ] || { echo "  🤗 nothing to push ($file missing/empty)"; return 0; }
 
@@ -113,9 +121,13 @@ def _err_details(e):
     return " | ".join(parts)
 
 
+LAST_UPLOAD_ERR = ""
+
+
 def _upload_with_retry(api, *, path_or_fileobj, path_in_repo, repo_id, repo_type, commit_message, attempts=4):
     """Upload with exponential backoff (2s/8s/32s). Transient 429/5xx and
     Xet/LFS hiccups are common on large (~600 MB) uploads; retry those."""
+    global LAST_UPLOAD_ERR
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -129,6 +141,7 @@ def _upload_with_retry(api, *, path_or_fileobj, path_in_repo, repo_id, repo_type
             return True
         except Exception as e:
             last_err = e
+            LAST_UPLOAD_ERR = repr(e) + " " + str(e)
             if attempt < attempts:
                 wait = 2 ** (2 * attempt - 1)  # 2s, 8s, 32s
                 print(f"  ⚠️  upload attempt {attempt}/{attempts} failed: {_err_details(e)}", file=sys.stderr)
@@ -156,6 +169,13 @@ if not _upload_with_retry(
     repo_type="dataset",
     commit_message=f"Update latest backup ({size_mb:.1f} MB)",
 ):
+    err = LAST_UPLOAD_ERR
+    if "storage limit" in err.lower() or "private storage" in err.lower():
+        print("  🚫 Hugging Face private storage quota is exhausted — disabling HF backup for this session.")
+        print("      Off-site copies continue via Cloudflare KV and the GitHub Release live-backup.")
+        print("      To re-enable: free vault space or upgrade the HF plan, then delete .hf-storage-full.")
+        with open(".hf-storage-full", "w") as mf:
+            mf.write("quota exhausted at " + datetime.datetime.now(datetime.timezone.utc).isoformat() + "\n")
     sys.exit(1)
 
 # 3. Upload dated historical snapshot
