@@ -94,7 +94,11 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
   # pg_dump (container's postgres user) creates the dump dir with 0700 —
   # unreadable by the runner-side tar that packs the archive AND by the
   # container-side pg_restore after the next session extracts it. Relax it.
-  docker compose exec -T db chmod -R a+rX "$STAGING_IN_CONTAINER/$DB_DUMP_NAME" </dev/null >/dev/null 2>&1 || true
+  # a+rwX (not a+rX): the runner must also be able to DELETE these dirs when
+  # rotating db-backups.previous — a+rX left them undeletable, so every
+  # snapshot nested the old dumps inside db-backups.previous and the archive
+  # grew ~20MB per tick until the HF vault hit its storage quota.
+  docker compose exec -T db chmod -R a+rwX "$STAGING_IN_CONTAINER/$DB_DUMP_NAME" </dev/null >/dev/null 2>&1 || true
   printf '%s\t%s\t%s\n' "$DB_DUMP_NAME" "$DB_NAME_B64" "$DB_OWNER_B64" >> "$DB_STAGING/manifest.tsv"
 done
 
@@ -105,13 +109,16 @@ if [ "$DB_INDEX" -eq 0 ]; then
 fi
 
 DB_OLD="./db-backups.previous"
-rm -rf "$DB_OLD"
+# sudo: the dump dirs are owned by the container user; if the chmod above ever
+# misses, a plain rm would fail and the rotation would nest old dumps inside
+# db-backups.previous forever (archive growth + HF quota exhaustion).
+sudo rm -rf "$DB_OLD" 2>/dev/null || rm -rf "$DB_OLD" 2>/dev/null || true
 if [ -d ./db-backups ]; then
   mv ./db-backups "$DB_OLD"
 fi
 if mv "$DB_STAGING" ./db-backups; then
   DB_STAGING=""
-  rm -rf "$DB_OLD"
+  sudo rm -rf "$DB_OLD" 2>/dev/null || rm -rf "$DB_OLD" 2>/dev/null || true
   echo "  ✅ complete database snapshot updated ($DB_INDEX databases)"
 else
   [ ! -d "$DB_OLD" ] || mv "$DB_OLD" ./db-backups
@@ -481,9 +488,42 @@ if [ -s ./supabase-state.tar.zst ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] \
 fi
 
 # ── 9. Off-site mirror to Hugging Face Private Dataset (50 GB Vault) ───
+# Throttled to every 30 min (HF_PUSH_INTERVAL, override with env): each push
+# uploads the archive + a dated history copy, and every upload consumes vault
+# storage — pushing every snapshot tick exhausted the free quota.
+# FORCE_PUSH=1 (final backup at shutdown) always pushes so the newest state
+# reaches HF before the session ends.
+HF_INTERVAL="${HF_PUSH_INTERVAL:-1800}"
+HF_MARKER=./.hf_push_last
+HF_SHA_MARKER=./.hf_push_sha
 if [ -s ./supabase-state.tar.zst ]; then
   if grep -q '^HF_TOKEN=.' .env 2>/dev/null || [ -n "${HF_TOKEN:-}" ]; then
-    bash utils/huggingface-backup.sh push ./supabase-state.tar.zst || echo "  ⚠️  Hugging Face backup failed; other backups preserved"
+    DO_HF=1
+    CURRENT_HF_SHA=$(sha256sum ./supabase-state.tar.zst 2>/dev/null | cut -d' ' -f1)
+    LAST_HF_SHA=$(cat "$HF_SHA_MARKER" 2>/dev/null || echo "")
+    if [ "${FORCE_PUSH:-0}" != "1" ]; then
+      if [ -n "$CURRENT_HF_SHA" ] && [ "$CURRENT_HF_SHA" = "$LAST_HF_SHA" ]; then
+        DO_HF=0
+        echo "  ℹ️  Hugging Face push skipped (state archive unchanged since last push)"
+      elif [ -f "$HF_MARKER" ]; then
+        LAST_HF=$(cat "$HF_MARKER" 2>/dev/null || echo 0)
+        NOW=$(date +%s)
+        if [[ "$LAST_HF" =~ ^[0-9]+$ ]] \
+           && [ "$LAST_HF" -le "$NOW" ] \
+           && [ $(( NOW - LAST_HF )) -lt $HF_INTERVAL ]; then
+          DO_HF=0
+          echo "  ℹ️  Hugging Face push skipped (last push < $((HF_INTERVAL / 60)) min ago)"
+        fi
+      fi
+    fi
+    if [ "$DO_HF" = 1 ]; then
+      date +%s > "$HF_MARKER"
+      if bash utils/huggingface-backup.sh push ./supabase-state.tar.zst; then
+        [ -n "$CURRENT_HF_SHA" ] && printf '%s' "$CURRENT_HF_SHA" > "$HF_SHA_MARKER"
+      else
+        echo "  ⚠️  Hugging Face backup failed; other backups preserved"
+      fi
+    fi
   fi
 fi
 
