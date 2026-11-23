@@ -477,11 +477,11 @@ jobs:
             local archive="$1"
             local members_file member
             members_file=$(mktemp)
-            if ! tar --use-compress-program=zstd -tf "$archive" >/dev/null 2>&1; then
+            if ! tar -tf "$archive" >/dev/null 2>&1; then
               rm -f "$members_file"
               return 1
             fi
-            if tar --use-compress-program=zstd -tvf "$archive" 2>/dev/null \
+            if tar -tvf "$archive" 2>/dev/null \
               | awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { found = 1 } END { exit !found }'; then
               rm -f "$members_file"
               return 1
@@ -522,8 +522,8 @@ jobs:
                   fi
                   ;;
               esac
-            done < <(tar --use-compress-program=zstd -tf "$archive" 2>/dev/null)
-            if [ ! -s "$members_file" ] || ! tar --use-compress-program=zstd -xf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
+            done < <(tar -tf "$archive" 2>/dev/null)
+            if [ ! -s "$members_file" ] || ! tar -xf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
               rm -f "$members_file"
               return 1
             fi
@@ -553,13 +553,13 @@ jobs:
           if [ -f ./supabase-state.tar.zst ]; then
             echo " State archive found  restoring databases, roles, Redis, functions, snippets, settings, and pgsodium key..."
 
-            LOCAL_TS="$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+            LOCAL_TS="$(tar -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
             LOCAL_TS="${LOCAL_TS:-0}"
 
             GH_TS=0
             if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
               if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.zst" -O ./supabase-state.tar.zst.gh 2>/dev/null && [ -s ./supabase-state.tar.zst.gh ]; then
-                GH_TS="$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst.gh -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+                GH_TS="$(tar -xf ./supabase-state.tar.zst.gh -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
                 GH_TS="${GH_TS:-0}"
               fi
             fi
@@ -696,7 +696,7 @@ jobs:
           rm -f ./.state-baseline
           if [ -f ./supabase-state.tar.zst ]; then
             BASELINE_BYTES=$(wc -c < ./supabase-state.tar.zst | tr -d ' \n')
-            BASELINE_TS=$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+            BASELINE_TS=$(tar -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
             printf 'size=%s\nts=%s\n' "${BASELINE_BYTES:-0}" "${BASELINE_TS:-0}" > ./.state-baseline
             echo "   state baseline: ${BASELINE_BYTES:-0} bytes, state-ts ${BASELINE_TS:-unknown}"
           fi
@@ -935,7 +935,7 @@ jobs:
                 IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 EXTRA_FIELD <<< "$MANIFEST_LINE"
                 [ -n "$DB_DUMP_NAME" ] || continue
                 if [ -n "$EXTRA_FIELD" ] \
-                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.d$ ]] \
+                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.(d|dump)$ ]] \
                    || [ -z "$DB_NAME_B64" ] || [ -z "$DB_OWNER_B64" ]; then
                   echo "::error::invalid database entry in backup manifest"
                   rm -f "$PREFLIGHT_NAMES"
@@ -958,7 +958,7 @@ jobs:
                    || [ "$(printf '%s' "$DB_NAME" | base64 -w0)" != "$DB_NAME_B64" ] \
                    || [ "$(printf '%s' "$DB_OWNER" | base64 -w0)" != "$DB_OWNER_B64" ] \
                    || grep -Fxq "$DB_NAME" "$PREFLIGHT_NAMES" \
-                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ]; then
+                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ] && [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
                   echo "::error::invalid or duplicate database metadata in backup manifest"
                   rm -f "$PREFLIGHT_NAMES"
                   echo 1 > "$STATUS_FILE"
@@ -994,7 +994,7 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 -type d -name 'db-*.d' | wc -l)
+              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 \( -type d -name 'db-*.d' -o -type f -name 'db-*.dump' \) | wc -l)
               if [ "$DUMP_FILE_COUNT" -ne "$PREFLIGHT_COUNT" ]; then
                 echo "::error::database backup contains unreferenced or missing dump files"
                 echo 1 > "$STATUS_FILE"
@@ -1063,6 +1063,7 @@ jobs:
                 [ -n "$DB_DUMP_NAME" ] || continue
                 case "$DB_DUMP_NAME" in
                   db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d) ;;
+                  db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump) ;;
                   *)
                     echo "::error::invalid database dump entry in backup manifest"
                     RESTORE_FAILED=1
@@ -1080,7 +1081,7 @@ jobs:
                   break
                 }
                 if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
-                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ]; then
+                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ] && [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
                   echo "::error::incomplete database entry in backup manifest: $DB_DUMP_NAME"
                   RESTORE_FAILED=1
                   break
@@ -1754,12 +1755,12 @@ jobs:
 
           # 1. Integrity: readable archive that still carries the database set.
           [ -s "$ARCHIVE" ] || fail "no state archive on disk at shutdown - nothing to persist"
-          tar --use-compress-program=zstd -tf "$ARCHIVE" >/dev/null 2>&1 || fail "state archive is not a readable state archive"
-          tar --use-compress-program=zstd -tf "$ARCHIVE" 2>/dev/null | grep -qx 'db-backups/manifest.tsv' \
+          tar -tf "$ARCHIVE" >/dev/null 2>&1 || fail "state archive is not a readable state archive"
+          tar -tf "$ARCHIVE" 2>/dev/null | grep -qx 'db-backups/manifest.tsv' \
             || fail "state archive contains no database manifest (db-backups/manifest.tsv)"
 
           ARCHIVE_BYTES=$(wc -c < "$ARCHIVE" | tr -d ' \n')
-          ARCHIVE_TS=$(tar --use-compress-program=zstd -xf "$ARCHIVE" -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+          ARCHIVE_TS=$(tar -xf "$ARCHIVE" -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
 
           # 2. Freshness: snapshot-state.sh writes ./state-ts BEFORE it packs and
           #    publishes the archive atomically, so on success the two agree. A
