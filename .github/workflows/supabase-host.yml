@@ -1168,7 +1168,7 @@ jobs:
                 TOC_FILE="./.restore-toc.$DB_INDEX"
                 docker compose exec -T db pg_restore -U postgres \
                   --list "/mnt/host/db-backups/$DB_DUMP_NAME" </dev/null 2>/dev/null \
-                  | grep -v 'TABLE DATA log_events' > "$TOC_FILE" || true
+                  | grep -vE 'TABLE DATA [^ ]+ log_events' > "$TOC_FILE" || true
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
                 if [ "$DB_NAME" = "postgres" ]; then
