@@ -73,7 +73,7 @@ env:
 jobs:
   supabase:
     runs-on: ubuntu-latest
-    timeout-minutes: 355                  # 5h55m  5 min buffer under 360 min hard limit
+    timeout-minutes: 359                  # 1 min under the 360 min hard job limit
     permissions:
       contents: write                     # checkout + GitHub Release rolling backup
       actions: write                      # prune stale state-snapshot cache entries
@@ -1113,7 +1113,7 @@ jobs:
                     | docker compose exec -T db psql -U supabase_admin -d postgres >/dev/null 2>&1 || true
 
                   docker compose exec -T db pg_restore -U supabase_admin \
-                    --clean --if-exists --disable-triggers --exit-on-error \
+                    --clean --if-exists --disable-triggers --exit-on-error --jobs 4 \
                     -d postgres "/tmp/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                   if [ "$RESTORE_STATUS" -ne 0 ]; then
                     echo "::error::PostgreSQL restore failed for postgres:"
@@ -1145,7 +1145,7 @@ jobs:
                   # databases and is superuser. --create issues CREATE DATABASE
                   # (needs CREATEDB) and --disable-triggers needs superuser.
                   docker compose exec -T db pg_restore -U supabase_admin \
-                    --clean --if-exists --create --disable-triggers --exit-on-error \
+                    --clean --if-exists --create --disable-triggers --exit-on-error --jobs 4 \
                     -d template1 "/tmp/$DB_DUMP_NAME" </dev/null 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                   if [ "$RESTORE_STATUS" -ne 0 ]; then
                     echo "::error::PostgreSQL restore failed for $DB_NAME:"
@@ -1214,7 +1214,7 @@ jobs:
               fi
               RESTORE_LOG=$(mktemp)
               if ! docker compose exec -T db pg_restore -U supabase_admin -d postgres \
-                 --no-owner --no-privileges --disable-triggers --exit-on-error --jobs 2 \
+                 --no-owner --no-privileges --disable-triggers --exit-on-error --jobs 4 \
                    /tmp/backup.dump 2>"$RESTORE_LOG"; then
                 echo "::error::legacy database restore failed"
                 tail -20 "$RESTORE_LOG" | sed 's/^/    /'
@@ -1462,10 +1462,12 @@ jobs:
           cd "$SUPABASE_DIR"
           rm -f ./.snapshot-success
 
-          DURATION=18300  # 5h05m  leaves ~50 min buffer for final backup + cache save
-          # (was 5h30m; the old 25 min shutdown budget was too tight for large DBs
-          # and could cut the cache save off at the 355-min timeout, losing up to
-          # 5h of data on the next restore).
+          DURATION=20700  # 5h45m live — the maximum that fits GitHub's 360-min
+          # hard job cap with room for restore (~4 min) + shutdown backup and
+          # cache save (~3 min with compress=0 dumps). A session cannot run a
+          # full 6h LIVE because GitHub kills the whole job (including the
+          # always(): cache save) at 360 min — that would lose ALL state.
+          # (was 5h05m; total wall time is now ~5h52m per session.)
           END_TIME=$(( $(date +%s) + DURATION ))
           DOMAIN="$TUNNEL_DOMAIN"
           REDIS_DOMAIN="redis.${DOMAIN#supabase.}"

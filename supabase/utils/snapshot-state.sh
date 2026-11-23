@@ -64,7 +64,9 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
   fi
   DB_DUMP_NAME="$(printf 'db-%08d.dump' "$DB_INDEX")"
   echo "  🗄️  dumping database: $DB_NAME"
-  if ! docker compose exec -T db pg_dump -U postgres --format=custom --compress=6 --create \
+  # --compress=0: the archive is gzip-compressed once more by tar below, so
+  # zlib-6 inside pg_dump was pure double compression (~3x slower dumps).
+  if ! docker compose exec -T db pg_dump -U postgres --format=custom --compress=0 --create \
        --dbname="$DB_NAME" </dev/null > "$DB_STAGING/$DB_DUMP_NAME" \
        || [ ! -s "$DB_STAGING/$DB_DUMP_NAME" ]; then
     echo "  ERROR: failed to dump database: $DB_NAME" >&2
@@ -325,7 +327,10 @@ pack_archive() {
 
   rm -f ./supabase-state.tar.gz.new
   tar_log="$(mktemp)"
-  tar_args=(--warning=no-file-changed -czf ./supabase-state.tar.gz.new -C .)
+  # gzip -1: ~3x faster than the default -6 with a modest size increase; the
+  # archive only lives until the next 60s snapshot or the end-of-run cache
+  # save (which recompresses with zstd anyway).
+  tar_args=(--warning=no-file-changed --use-compress-program='gzip -1' -cf ./supabase-state.tar.gz.new -C .)
   tar_args+=("${archive_files[@]}")
   if [ -n "$inbucket_stage" ]; then
     tar_args+=(-C "$inbucket_stage" volumes/inbucket/data)
