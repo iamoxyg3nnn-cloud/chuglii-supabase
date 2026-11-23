@@ -66,7 +66,7 @@ concurrency:
 env:
   SUPABASE_DIR: ./supabase
   # Full-state archive: DB dump + edge functions + snippets + pgsodium key
-  BACKUP_FILE: ./supabase/supabase-state.tar.gz
+  BACKUP_FILE: ./supabase/supabase-state.tar.zst
   COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml:docker-compose.redis.yml
   DOCKER_SOCKET_LOCATION: /var/run/docker.sock
 
@@ -477,18 +477,18 @@ jobs:
             local archive="$1"
             local members_file member
             members_file=$(mktemp)
-            if ! tar tzf "$archive" >/dev/null 2>&1; then
+            if ! tar --use-compress-program=zstd -tf "$archive" >/dev/null 2>&1; then
               rm -f "$members_file"
               return 1
             fi
-            if tar -tvzf "$archive" 2>/dev/null \
+            if tar --use-compress-program=zstd -tvf "$archive" 2>/dev/null \
               | awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { found = 1 } END { exit !found }'; then
               rm -f "$members_file"
               return 1
             fi
             while IFS= read -r member; do
               case "$member" in
-                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|postgresql.auto.conf|./postgresql.auto.conf|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|appendonlydir/appendonly.aof.manifest|./appendonlydir/appendonly.aof.manifest|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/inbucket/data|./volumes/inbucket/data|volumes/inbucket/data/|./volumes/inbucket/data/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|db-backups|./db-backups|db-backups/|./db-backups/|db-backups/globals.sql|./db-backups/globals.sql|db-backups/manifest.tsv|./db-backups/manifest.tsv|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|.state-settings.env|./.state-settings.env|.cf-creds|./.cf-creds|state-ts|./state-ts)
+                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|postgresql.auto.conf|./postgresql.auto.conf|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|appendonlydir/appendonly.aof.manifest|./appendonlydir/appendonly.aof.manifest|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/inbucket/data|./volumes/inbucket/data|volumes/inbucket/data/|./volumes/inbucket/data/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|db-backups|./db-backups|db-backups/|./db-backups/|db-backups/globals.sql|./db-backups/globals.sql|db-backups/manifest.tsv|./db-backups/manifest.tsv|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d/|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d/|.state-settings.env|./.state-settings.env|.cf-creds|./.cf-creds|state-ts|./state-ts)
                   case "$member" in
                     */) ;;
                     *) printf '%s\n' "$member" >> "$members_file" ;;
@@ -522,8 +522,8 @@ jobs:
                   fi
                   ;;
               esac
-            done < <(tar tzf "$archive" 2>/dev/null)
-            if [ ! -s "$members_file" ] || ! tar xzf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
+            done < <(tar --use-compress-program=zstd -tf "$archive" 2>/dev/null)
+            if [ ! -s "$members_file" ] || ! tar --use-compress-program=zstd -xf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
               rm -f "$members_file"
               return 1
             fi
@@ -531,35 +531,35 @@ jobs:
           }
 
           # Multi-source disaster recovery: check GitHub Release, Cloudflare KV, and Actions Cache
-          if [ ! -f ./supabase-state.tar.gz ] && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+          if [ ! -f ./supabase-state.tar.zst ] && [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
             echo "  ℹ️ No cached state archive on disk — checking GitHub Release (live-backup)..."
-            if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.gz" -O ./supabase-state.tar.gz 2>/dev/null && [ -s ./supabase-state.tar.gz ]; then
+            if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.zst" -O ./supabase-state.tar.zst 2>/dev/null && [ -s ./supabase-state.tar.zst ]; then
               echo "  ✅ Adopted state archive from GitHub Release!"
             fi
           fi
 
-          if [ ! -f ./supabase-state.tar.gz ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+          if [ ! -f ./supabase-state.tar.zst ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
             echo "  No state archive on disk  attempting Cloudflare restore..."
-            if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz 2>/dev/null && [ -s ./supabase-state.tar.gz ]; then
+            if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.zst 2>/dev/null && [ -s ./supabase-state.tar.zst ]; then
               echo "  ✅ Adopted state archive from Cloudflare KV"
             fi
           fi
 
-          if [ ! -f ./supabase-state.tar.gz ] && [ "${GITHUB_RUN_NUMBER:-0}" -gt 1 ]; then
+          if [ ! -f ./supabase-state.tar.zst ] && [ "${GITHUB_RUN_NUMBER:-0}" -gt 1 ]; then
             echo "::error::no cached or off-site state archive exists after the first workflow run; refusing to create an empty replacement database"
             exit 1
           fi
 
-          if [ -f ./supabase-state.tar.gz ]; then
+          if [ -f ./supabase-state.tar.zst ]; then
             echo " State archive found  restoring databases, roles, Redis, functions, snippets, settings, and pgsodium key..."
 
-            LOCAL_TS="$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+            LOCAL_TS="$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
             LOCAL_TS="${LOCAL_TS:-0}"
 
             GH_TS=0
             if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-              if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.gz" -O ./supabase-state.tar.gz.gh 2>/dev/null && [ -s ./supabase-state.tar.gz.gh ]; then
-                GH_TS="$(tar xzf ./supabase-state.tar.gz.gh -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+              if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download live-backup -p "supabase-state.tar.zst" -O ./supabase-state.tar.zst.gh 2>/dev/null && [ -s ./supabase-state.tar.zst.gh ]; then
+                GH_TS="$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst.gh -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
                 GH_TS="${GH_TS:-0}"
               fi
             fi
@@ -571,28 +571,28 @@ jobs:
 
             if [ "$GH_TS" -gt "$LOCAL_TS" ] && [ "$GH_TS" -ge "$KV_TS" ]; then
               echo "  📦 GitHub Release backup is the freshest ($GH_TS > $LOCAL_TS) — adopting it"
-              mv -f ./supabase-state.tar.gz.gh ./supabase-state.tar.gz
+              mv -f ./supabase-state.tar.zst.gh ./supabase-state.tar.zst
             elif [ "$KV_TS" -gt "$LOCAL_TS" ] && [ "$KV_TS" -gt "$GH_TS" ]; then
               echo "  ☁️ Cloudflare KV backup is the freshest ($KV_TS > $LOCAL_TS) — adopting it"
-              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.kv 2>/dev/null && [ -s ./supabase-state.tar.gz.kv ]; then
-                mv -f ./supabase-state.tar.gz.kv ./supabase-state.tar.gz
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.zst.kv 2>/dev/null && [ -s ./supabase-state.tar.zst.kv ]; then
+                mv -f ./supabase-state.tar.zst.kv ./supabase-state.tar.zst
               fi
             else
               echo "  💾 Using Actions Cache backup ($LOCAL_TS)"
             fi
-            rm -f ./supabase-state.tar.gz.gh ./supabase-state.tar.gz.kv
+            rm -f ./supabase-state.tar.zst.gh ./supabase-state.tar.zst.kv
 
             # Extraction must NOT fail silently: continuing without the archive
             # can leave the stack running on an incomplete state.
-            if ! extract_state_archive ./supabase-state.tar.gz; then
+            if ! extract_state_archive ./supabase-state.tar.zst; then
               echo "::warning::cached state archive is unreadable or unsupported — attempting off-site recovery"
-              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.offsite \
-                 && [ -s ./supabase-state.tar.gz.offsite ] \
-                 && extract_state_archive ./supabase-state.tar.gz.offsite; then
-                mv -f ./supabase-state.tar.gz.offsite ./supabase-state.tar.gz
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.zst.offsite \
+                 && [ -s ./supabase-state.tar.zst.offsite ] \
+                 && extract_state_archive ./supabase-state.tar.zst.offsite; then
+                mv -f ./supabase-state.tar.zst.offsite ./supabase-state.tar.zst
                 echo "  ✅ state recovered from the off-site Cloudflare backup"
               else
-                rm -f ./supabase-state.tar.gz.offsite
+                rm -f ./supabase-state.tar.zst.offsite
                 echo "::error::state archive is corrupt and no off-site copy could be restored. Refusing to continue as a silent fresh start. Delete the bad supabase-db-* cache entries or restore from Cloudflare KV, then re-run."
                 exit 1
               fi
@@ -694,9 +694,9 @@ jobs:
           # smaller than its own input. Captured here - after extraction, before
           # the first new snapshot overwrites ./state-ts and the archive.
           rm -f ./.state-baseline
-          if [ -f ./supabase-state.tar.gz ]; then
-            BASELINE_BYTES=$(wc -c < ./supabase-state.tar.gz | tr -d ' \n')
-            BASELINE_TS=$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+          if [ -f ./supabase-state.tar.zst ]; then
+            BASELINE_BYTES=$(wc -c < ./supabase-state.tar.zst | tr -d ' \n')
+            BASELINE_TS=$(tar --use-compress-program=zstd -xf ./supabase-state.tar.zst -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
             printf 'size=%s\nts=%s\n' "${BASELINE_BYTES:-0}" "${BASELINE_TS:-0}" > ./.state-baseline
             echo "   state baseline: ${BASELINE_BYTES:-0} bytes, state-ts ${BASELINE_TS:-unknown}"
           fi
@@ -734,7 +734,7 @@ jobs:
           # prints "No database backup found; starting a fresh database" and keeps
           # going when the directory exists but the manifest/globals are missing,
           # which booted an empty stack and then snapshotted it over the good archive.
-          if [ -f ./supabase-state.tar.gz ] \
+          if [ -f ./supabase-state.tar.zst ] \
              && [ ! -f ./backup.dump ] \
              && { [ ! -s ./db-backups/manifest.tsv ] || [ ! -s ./db-backups/globals.sql ]; }; then
             echo "::error::state archive contains no usable database backup (manifest/globals missing); refusing to start a silent fresh database"
@@ -907,6 +907,24 @@ jobs:
               return
             fi
 
+            # ── Restore-mode Postgres tuning (3-5x faster pg_restore) ──
+            # All of these are SIGHUP/user-reloadable, so no restart is needed.
+            # Safe because a crashed restore simply re-restores from the cache
+            # on the next session; the settings are REVERTED right after the
+            # restore (and again in the final-backup step) so fsync=off can
+            # never leak into a state snapshot.
+            if ! docker compose exec -T db psql -U supabase_admin -d postgres -q \
+                 -c "ALTER SYSTEM SET fsync = off;" \
+                 -c "ALTER SYSTEM SET synchronous_commit = off;" \
+                 -c "ALTER SYSTEM SET full_page_writes = off;" \
+                 -c "ALTER SYSTEM SET max_wal_size = '10GB';" \
+                 -c "ALTER SYSTEM SET maintenance_work_mem = '1GB';" \
+                 -c "SELECT pg_reload_conf();" >/dev/null 2>&1; then
+              echo "  ⚠️  could not apply restore-mode tuning; continuing with default settings"
+            else
+              echo "  ⚡ restore-mode Postgres tuning applied (fsync/synchronous_commit off, 1GB maintenance_work_mem)"
+            fi
+
             if [ -s ./db-backups/manifest.tsv ] && [ -s ./db-backups/globals.sql ]; then
               echo "Restoring all databases and PostgreSQL roles from the complete state backup..."
               PREFLIGHT_NAMES=$(mktemp)
@@ -917,7 +935,7 @@ jobs:
                 IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 EXTRA_FIELD <<< "$MANIFEST_LINE"
                 [ -n "$DB_DUMP_NAME" ] || continue
                 if [ -n "$EXTRA_FIELD" ] \
-                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.dump$ ]] \
+                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.d$ ]] \
                    || [ -z "$DB_NAME_B64" ] || [ -z "$DB_OWNER_B64" ]; then
                   echo "::error::invalid database entry in backup manifest"
                   rm -f "$PREFLIGHT_NAMES"
@@ -940,7 +958,7 @@ jobs:
                    || [ "$(printf '%s' "$DB_NAME" | base64 -w0)" != "$DB_NAME_B64" ] \
                    || [ "$(printf '%s' "$DB_OWNER" | base64 -w0)" != "$DB_OWNER_B64" ] \
                    || grep -Fxq "$DB_NAME" "$PREFLIGHT_NAMES" \
-                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ]; then
                   echo "::error::invalid or duplicate database metadata in backup manifest"
                   rm -f "$PREFLIGHT_NAMES"
                   echo 1 > "$STATUS_FILE"
@@ -976,7 +994,7 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 -type f -name 'db-*.dump' | wc -l)
+              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 -type d -name 'db-*.d' | wc -l)
               if [ "$DUMP_FILE_COUNT" -ne "$PREFLIGHT_COUNT" ]; then
                 echo "::error::database backup contains unreferenced or missing dump files"
                 echo 1 > "$STATUS_FILE"
@@ -1044,7 +1062,7 @@ jobs:
                 IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 <<< "$MANIFEST_LINE"
                 [ -n "$DB_DUMP_NAME" ] || continue
                 case "$DB_DUMP_NAME" in
-                  db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump) ;;
+                  db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d) ;;
                   *)
                     echo "::error::invalid database dump entry in backup manifest"
                     RESTORE_FAILED=1
@@ -1062,7 +1080,7 @@ jobs:
                   break
                 }
                 if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
-                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                   || [ ! -d "./db-backups/$DB_DUMP_NAME" ]; then
                   echo "::error::incomplete database entry in backup manifest: $DB_DUMP_NAME"
                   RESTORE_FAILED=1
                   break
@@ -1227,6 +1245,18 @@ jobs:
               echo "No database backup found; starting a fresh database"
               return
             fi
+
+            # ── Revert restore-mode tuning BEFORE anything snapshots auto.conf ──
+            # fsync=off must never survive into postgresql.auto.conf (which
+            # snapshot-state.sh archives) or the next session boots non-durable.
+            docker compose exec -T db psql -U supabase_admin -d postgres -q \
+              -c "ALTER SYSTEM RESET fsync;" \
+              -c "ALTER SYSTEM RESET synchronous_commit;" \
+              -c "ALTER SYSTEM RESET full_page_writes;" \
+              -c "ALTER SYSTEM RESET max_wal_size;" \
+              -c "ALTER SYSTEM RESET maintenance_work_mem;" \
+              -c "SELECT pg_reload_conf();" \
+              -c "CHECKPOINT;" >/dev/null 2>&1 || true
 
             #  Verify restore success 
             echo "Verifying restore..."
@@ -1399,8 +1429,8 @@ jobs:
 
           echo "=============================================================="
           echo "   cache hit:      ${{ steps.cache-db.outputs.cache-hit }}"
-          if [ -f ./supabase-state.tar.gz ]; then
-            echo "    restored archive: $(du -h ./supabase-state.tar.gz | cut -f1)"
+          if [ -f ./supabase-state.tar.zst ]; then
+            echo "    restored archive: $(du -h ./supabase-state.tar.zst | cut -f1)"
           else
             echo "    restored archive: none (fresh start)"
           fi
@@ -1692,6 +1722,16 @@ jobs:
           # otherwise the value the containers actually booted with from .env.
           REDIS_PASSWORD="${REDIS_PASSWORD:-$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')}"
           export REDIS_PASSWORD
+          # Belt-and-braces: make sure restore-mode tuning is reverted even if
+          # the restore step failed midway, before this snapshot captures
+          # postgresql.auto.conf.
+          docker compose exec -T db psql -U supabase_admin -d postgres -q \
+            -c "ALTER SYSTEM RESET fsync;" \
+            -c "ALTER SYSTEM RESET synchronous_commit;" \
+            -c "ALTER SYSTEM RESET full_page_writes;" \
+            -c "ALTER SYSTEM RESET max_wal_size;" \
+            -c "ALTER SYSTEM RESET maintenance_work_mem;" \
+            -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
           if bash utils/snapshot-state.sh; then
             touch ./.snapshot-success
           else
@@ -1705,7 +1745,7 @@ jobs:
           # snapshot this session took, and no smaller than the archive this
           # session started from — otherwise fail loudly and leave the previous
           # cache entry as the next session's restore target.
-          ARCHIVE=./supabase-state.tar.gz
+          ARCHIVE=./supabase-state.tar.zst
           fail() {
             echo "::error::$1"
             echo "cache_ready=false" >> "$GITHUB_OUTPUT"
@@ -1714,12 +1754,12 @@ jobs:
 
           # 1. Integrity: readable archive that still carries the database set.
           [ -s "$ARCHIVE" ] || fail "no state archive on disk at shutdown - nothing to persist"
-          tar tzf "$ARCHIVE" >/dev/null 2>&1 || fail "state archive is not a readable tar.gz"
-          tar tzf "$ARCHIVE" 2>/dev/null | grep -qx 'db-backups/manifest.tsv' \
+          tar --use-compress-program=zstd -tf "$ARCHIVE" >/dev/null 2>&1 || fail "state archive is not a readable state archive"
+          tar --use-compress-program=zstd -tf "$ARCHIVE" 2>/dev/null | grep -qx 'db-backups/manifest.tsv' \
             || fail "state archive contains no database manifest (db-backups/manifest.tsv)"
 
           ARCHIVE_BYTES=$(wc -c < "$ARCHIVE" | tr -d ' \n')
-          ARCHIVE_TS=$(tar xzf "$ARCHIVE" -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
+          ARCHIVE_TS=$(tar --use-compress-program=zstd -xf "$ARCHIVE" -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)
 
           # 2. Freshness: snapshot-state.sh writes ./state-ts BEFORE it packs and
           #    publishes the archive atomically, so on success the two agree. A
@@ -1772,7 +1812,7 @@ jobs:
         id: cache-save
         # always(): a cancelled run or the 355-min job timeout must still persist
         # the freshest archive, otherwise an operator 'restart' loses everything.
-        if: ${{ always() && steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.gz') != '' }}
+        if: ${{ always() && steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.zst') != '' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.BACKUP_FILE }}

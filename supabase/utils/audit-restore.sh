@@ -177,7 +177,7 @@ echo "=============================================================="
 
 # ── drift guard: the dump flags this audit exercises must still be the ones
 #    snapshot-state.sh uses, or the audit would be testing a fiction.
-for needle in '--format=custom --compress=0 --create' 'pg_dumpall' 'pg_restore --list'; do
+for needle in '--format=directory --jobs=4 --compress=0 --create' 'pg_dumpall' 'pg_restore --list'; do
   grep -qF -- "$needle" "$SNAPSHOT_SH" \
     || die "snapshot-state.sh no longer contains '$needle' — this audit would test the wrong dump"
 done
@@ -333,16 +333,29 @@ IDX=0
 while IFS='|' read -r N O; do
   [ -n "$N" ] || continue
   IDX=$((IDX + 1))
-  F=$(printf 'db-%08d.dump' "$IDX")
+  F=$(printf 'db-%08d.d' "$IDX")
   # < /dev/null HERE and in the preflight loop: `docker exec -i` drains its
   # stdin when the child doesn't read it, which consumed the enclosing
   # read-loop's file — the first CI docker run failed with exactly this and
   # only snapshotted the first database in the list.
-  pq 1 pg_dump -U postgres --format=custom --compress=0 --create --dbname="$N" \
-    </dev/null > "$WORK/db-backups/$F" 2>/dev/null \
-    || { fail "pg_dump failed for $N"; exit 1; }
-  pq 1 pg_restore -U postgres --list < "$WORK/db-backups/$F" >/dev/null 2>&1 \
-    || { fail "dump validation failed for $N"; exit 1; }
+  # Directory format + --jobs=4, mirroring snapshot-state.sh: dump inside the
+  # container with -f, copy the directory out, validate, then clean up.
+  if [ "$BACKEND" = "docker" ]; then
+    pq 1 pg_dump -U postgres --format=directory --jobs=4 --compress=0 --create --dbname="$N" \
+      -f "/tmp/$F" </dev/null >/dev/null 2>&1 \
+      || { fail "pg_dump failed for $N"; exit 1; }
+    pq 1 pg_restore -U postgres --list "/tmp/$F" </dev/null >/dev/null 2>&1 \
+      || { fail "dump validation failed for $N"; exit 1; }
+    docker cp "$(cname 1):/tmp/$F" "$WORK/db-backups/$F" >/dev/null \
+      || { fail "could not copy directory dump for $N"; exit 1; }
+    docker exec "$(cname 1)" rm -rf "/tmp/$F" >/dev/null
+  else
+    pq 1 pg_dump -U postgres --format=directory --jobs=4 --compress=0 --create --dbname="$N" \
+      -f "$WORK/db-backups/$F" </dev/null >/dev/null 2>&1 \
+      || { fail "pg_dump failed for $N"; exit 1; }
+    pq 1 pg_restore -U postgres --list "$WORK/db-backups/$F" >/dev/null 2>&1 \
+      || { fail "dump validation failed for $N"; exit 1; }
+  fi
   printf '%s\t%s\t%s\n' "$F" "$(b64e "$N")" "$(b64e "$O")" \
     >> "$WORK/db-backups/manifest.tsv"
 done < "$WORK/db_list.txt"
@@ -413,7 +426,7 @@ while IFS=$'\t' read -r D NB OB; do
       | grep -E '^ALTER DATABASE [^ ]+ SET ' \
       | pq 2 psql -X -U supabase_admin -q -d postgres >/dev/null 2>&1 || true
     if pq 2 pg_restore -U supabase_admin --clean --if-exists --disable-triggers \
-         --exit-on-error -d postgres "$SP" </dev/null > "$WORK/r_$N.log" 2>&1; then
+         --exit-on-error --jobs 4 -d postgres "$SP" </dev/null > "$WORK/r_$N.log" 2>&1; then
       A=0
       printf '%s\n' 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' \
         | pq 2 psql -X -U supabase_admin -q -d template1 -v ON_ERROR_STOP=1 -v "db_name=$N" -v "db_owner=$O" \
@@ -431,7 +444,7 @@ while IFS=$'\t' read -r D NB OB; do
   else
     pq 2 dropdb -U supabase_admin --maintenance-db=template1 --if-exists --force "$N" </dev/null >/dev/null 2>&1 || true
     if pq 2 pg_restore -U supabase_admin --clean --if-exists --create --disable-triggers \
-         --exit-on-error -d template1 "$SP" </dev/null > "$WORK/r_$N.log" 2>&1; then
+         --exit-on-error --jobs 4 -d template1 "$SP" </dev/null > "$WORK/r_$N.log" 2>&1; then
       A=0
       printf '%s\n' 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' \
         | pq 2 psql -X -U supabase_admin -q -d template1 -v ON_ERROR_STOP=1 -v "db_name=$N" -v "db_owner=$O" \

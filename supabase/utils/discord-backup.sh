@@ -45,7 +45,7 @@ cmd_push() {
   [ -n "$file" ] || { echo "  ⚠️  usage: discord-backup.sh push <file>"; return 1; }
   [ -s "$file" ] || { echo "  💬 nothing to push ($file missing/empty)"; return 0; }
 
-  if ! tar -tzf "$file" >/dev/null 2>&1; then
+  if ! tar -tf "$file" >/dev/null 2>&1; then
     echo "  ERROR: refusing to upload an invalid state archive: $file" >&2
     return 1
   fi
@@ -148,7 +148,7 @@ print(json.dumps(manifest, indent=2))
 
 # ---------------------------------------------------------------------------
 cmd_restore() {
-  local manifest="${1:-}" outfile="${2:-./supabase-state.tar.gz}"
+  local manifest="${1:-}" outfile="${2:-./supabase-state.tar.zst}"
   [ -n "$manifest" ] && [ -f "$manifest" ] || manifest="$BASE_DIR/discord-manifest.json"
   if [ ! -f "$manifest" ]; then
     echo "  ERROR: discord-manifest.json not found" >&2
@@ -208,7 +208,7 @@ print("  ✅ Download and integrity verified!")
   }
 
   rm -rf "$tmp"
-  if ! tar -tzf "$outfile" >/dev/null 2>&1; then
+  if ! tar -tf "$outfile" >/dev/null 2>&1; then
     echo "  ERROR: restored archive is not a valid tar.gz" >&2
     rm -f "$outfile"
     return 1

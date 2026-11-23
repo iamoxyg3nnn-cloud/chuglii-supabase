@@ -71,7 +71,7 @@ cmd_push() {
   [ -n "$file" ] || { echo "  ⚠️  usage: huggingface-backup.sh push <file>"; return 1; }
   [ -s "$file" ] || { echo "  🤗 nothing to push ($file missing/empty)"; return 0; }
 
-  if ! tar -tzf "$file" >/dev/null 2>&1; then
+  if ! tar -tf "$file" >/dev/null 2>&1; then
     echo "  ERROR: refusing to upload an invalid state archive: $file" >&2
     return 1
   fi
@@ -147,11 +147,11 @@ except Exception as e:
 
 # 2. Upload latest backup (overwrites latest pointer)
 size_mb = os.path.getsize(file_path) / (1024 * 1024)
-print(f"  Uploading latest/supabase-state.tar.gz ({size_mb:.1f} MB)...")
+print(f"  Uploading latest/supabase-state.tar.zst ({size_mb:.1f} MB)...")
 if not _upload_with_retry(
     api,
     path_or_fileobj=file_path,
-    path_in_repo="latest/supabase-state.tar.gz",
+    path_in_repo="latest/supabase-state.tar.zst",
     repo_id=repo_id,
     repo_type="dataset",
     commit_message=f"Update latest backup ({size_mb:.1f} MB)",
@@ -161,7 +161,7 @@ if not _upload_with_retry(
 # 3. Upload dated historical snapshot
 now_dt = datetime.datetime.now(datetime.timezone.utc)
 date_str = now_dt.strftime("%Y-%m-%d-%H%M%S")
-hist_path = f"history/supabase-state-{date_str}.tar.gz"
+hist_path = f"history/supabase-state-{date_str}.tar.zst"
 print(f"  Archiving {hist_path}...")
 _upload_with_retry(
     api,
@@ -208,7 +208,7 @@ print(f"  ✅ Hugging Face backup successful: {hist_path} (SHA: {sha[:16]}...)")
 
 # ---------------------------------------------------------------------------
 cmd_restore() {
-  local outfile="${1:-./supabase-state.tar.gz}"
+  local outfile="${1:-./supabase-state.tar.zst}"
   load_cfg
   if ! cfg_ok; then
     echo "  ERROR: HF_TOKEN / HF_REPO not configured" >&2
@@ -229,13 +229,22 @@ token = os.environ["HF_TOKEN"]
 repo_id = os.environ["HF_REPO"]
 out_file = sys.argv[1]
 
-# Download latest archive
-downloaded = hf_hub_download(
-    repo_id=repo_id,
-    filename="latest/supabase-state.tar.gz",
-    repo_type="dataset",
-    token=token
-)
+# Download latest archive (zstd is current; fall back to the legacy gzip
+# name so a vault written by the pre-zstd code still restores)
+try:
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename="latest/supabase-state.tar.zst",
+        repo_type="dataset",
+        token=token
+    )
+except Exception:
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename="latest/supabase-state.tar.gz",
+        repo_type="dataset",
+        token=token
+    )
 
 import shutil
 shutil.copyfile(downloaded, out_file)
@@ -245,7 +254,7 @@ print(f"  Downloaded {out_file} ({os.path.getsize(out_file)} bytes)")
     return 1
   }
 
-  if ! tar -tzf "$outfile" >/dev/null 2>&1; then
+  if ! tar -tf "$outfile" >/dev/null 2>&1; then
     echo "  ERROR: downloaded Hugging Face archive is corrupt" >&2
     rm -f "$outfile"
     return 1
@@ -278,7 +287,7 @@ except Exception as e:
     print(f"  ⚠️ Hugging Face pruning list failed: {e}")
     sys.exit(0)
 
-hist_files = [f for f in files if f.startswith("history/supabase-state-") and f.endswith(".tar.gz")]
+hist_files = [f for f in files if f.startswith("history/supabase-state-") and (f.endswith(".tar.zst") or f.endswith(".tar.gz"))]
 
 if len(hist_files) <= 1:
     print(f"  🤗 Hugging Face retention: {len(hist_files)} history backup exists — protected by sole-backup rule.")

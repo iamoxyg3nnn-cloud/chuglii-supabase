@@ -421,7 +421,7 @@ cmd_push() {
   [ -s "$file" ] || { echo "  ☁️  nothing to push ($file missing/empty)"; return 0; }
 
   local size base ts generation tmp sha manifest parts nn code attempt
-  if ! tar -tzf "$file" >/dev/null 2>&1; then
+  if ! tar -tf "$file" >/dev/null 2>&1; then
     echo "  ERROR: refusing to upload an invalid state archive: $file" >&2
     return 1
   fi
@@ -613,8 +613,8 @@ restore_once() {
     rm -rf "$tmp"
     return 1
   fi
-  if ! tar -tzf "$tmp/archive" >/dev/null 2>&1; then
-    echo "  ⚠️  downloaded state archive is not a valid tar.gz"
+  if ! tar -tf "$tmp/archive" >/dev/null 2>&1; then
+    echo "  ⚠️  downloaded state archive is not a valid state archive"
     rm -rf "$tmp"
     return 1
   fi

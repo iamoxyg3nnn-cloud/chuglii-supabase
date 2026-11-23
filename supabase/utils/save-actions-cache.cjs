@@ -2,7 +2,7 @@
 // =============================================================================
 // 💾 save-actions-cache.cjs — mid-job real-time GitHub Actions Cache saver
 // =============================================================================
-// Directly commits the current state archive (supabase-state.tar.gz) into the
+// Directly commits the current state archive (supabase-state.tar.zst) into the
 // GitHub Actions Cache while the session is actively running.
 //
 // Uses @actions/cache to communicate directly with GitHub's cache service using
@@ -17,7 +17,7 @@ const fs = require('fs');
 const path = require('path');
 
 async function main() {
-  const archivePath = process.argv[2] || path.join(__dirname, '..', 'supabase-state.tar.gz');
+  const archivePath = process.argv[2] || path.join(__dirname, '..', 'supabase-state.tar.zst');
   const runId = process.env.GITHUB_RUN_ID || 'manual';
   const slot = process.env.SLOT || Math.floor(Date.now() / 1000);
   const key = `supabase-db-live-${runId}-slot-${slot}`;

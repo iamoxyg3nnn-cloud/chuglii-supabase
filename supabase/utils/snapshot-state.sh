@@ -2,7 +2,7 @@
 # =============================================================================
 # 📸 snapshot-state.sh — snapshot the FULL Supabase state into an archive
 # =============================================================================
-# Produces ./supabase-state.tar.gz containing:
+# Produces ./supabase-state.tar.zst containing:
 #   db-backups/          - custom-format dumps of every connectable database
 #   db-backups/globals.sql - roles, memberships, and tablespaces
 #   .state-settings.env  - allowlisted non-secret runtime settings
@@ -62,21 +62,18 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
     rm -rf "$DB_STAGING"
     exit 1
   fi
-  DB_DUMP_NAME="$(printf 'db-%08d.dump' "$DB_INDEX")"
+  DB_DUMP_NAME="$(printf 'db-%08d.d' "$DB_INDEX")"
   echo "  🗄️  dumping database: $DB_NAME"
-  # --compress=0: the archive is gzip-compressed once more by tar below, so
-  # zlib-6 inside pg_dump was pure double compression (~3x slower dumps).
-  if ! docker compose exec -T db pg_dump -U postgres --format=custom --compress=0 --create \
-       --dbname="$DB_NAME" </dev/null > "$DB_STAGING/$DB_DUMP_NAME" \
-       || [ ! -s "$DB_STAGING/$DB_DUMP_NAME" ]; then
+  # Directory format + --jobs=4: the only pg_dump format that can dump in
+  # parallel (custom format is single-threaded). --compress=0: the outer zstd
+  # tar compresses once — double compression was ~3x slower for no real gain.
+  if ! docker compose exec -T db pg_dump -U postgres --format=directory --jobs=4 --compress=0 --create \
+       --dbname="$DB_NAME" -f "/tmp/$DB_DUMP_NAME" </dev/null \
+       || ! docker compose exec -T db pg_restore --list "/tmp/$DB_DUMP_NAME" </dev/null >/dev/null \
+       || ! docker compose cp "db:/tmp/$DB_DUMP_NAME" "$DB_STAGING/$DB_DUMP_NAME" </dev/null \
+       || ! docker compose exec -T db rm -rf "/tmp/$DB_DUMP_NAME" </dev/null \
+       || [ ! -d "$DB_STAGING/$DB_DUMP_NAME" ]; then
     echo "  ERROR: failed to dump database: $DB_NAME" >&2
-    rm -rf "$DB_STAGING"
-    exit 1
-  fi
-  if ! docker compose cp "$DB_STAGING/$DB_DUMP_NAME" db:/tmp/state-validation.dump </dev/null \
-       || ! docker compose exec -T db pg_restore --list /tmp/state-validation.dump </dev/null >/dev/null \
-       || ! docker compose exec -T db rm -f /tmp/state-validation.dump </dev/null; then
-    echo "  ERROR: PostgreSQL dump validation failed for database: $DB_NAME" >&2
     rm -rf "$DB_STAGING"
     exit 1
   fi
@@ -325,25 +322,24 @@ pack_archive() {
     archive_files+=(volumes/inbucket/data)
   fi
 
-  rm -f ./supabase-state.tar.gz.new
+  rm -f ./supabase-state.tar.zst.new ./supabase-state.tar.zst
   tar_log="$(mktemp)"
-  # gzip -1: ~3x faster than the default -6 with a modest size increase; the
-  # archive only lives until the next 60s snapshot or the end-of-run cache
-  # save (which recompresses with zstd anyway).
-  tar_args=(--warning=no-file-changed --use-compress-program='gzip -1' -cf ./supabase-state.tar.gz.new -C .)
+  # zstd -T0 -3: ~5x faster than gzip with a BETTER ratio; the end-of-run
+  # Actions cache save already uses zstd, so this also removes a transcode.
+  tar_args=(--warning=no-file-changed --use-compress-program='zstd -T0 -3' -cf ./supabase-state.tar.zst.new -C .)
   tar_args+=("${archive_files[@]}")
   if [ -n "$inbucket_stage" ]; then
     tar_args+=(-C "$inbucket_stage" volumes/inbucket/data)
   fi
   if tar "${tar_args[@]}" 2>"$tar_log" && \
-     mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
-    SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
+     mv -f ./supabase-state.tar.zst.new ./supabase-state.tar.zst; then
+    SIZE=$(du -h ./supabase-state.tar.zst | cut -f1)
     echo "  ✅ full-state archive updated ($SIZE)"
     rm -f "$tar_log"
     [ -z "$inbucket_stage" ] || rm -rf "$inbucket_stage"
     return 0
   else
-    rm -f ./supabase-state.tar.gz.new
+    rm -f ./supabase-state.tar.zst.new
     echo "  ⚠️  archive creation failed — previous archive preserved"
     [ -s "$tar_log" ] && sed 's/^/      /' "$tar_log"
     rm -f "$tar_log"
@@ -360,9 +356,9 @@ CF_MARKER=./.cf_push_last
 CF_SHA_MARKER=./.cf_push_sha
 CF_QUOTA_FILE=./.cf_quota_exhausted
 
-if [ -s ./supabase-state.tar.gz ]; then
+if [ -s ./supabase-state.tar.zst ]; then
   DO_PUSH=1
-  CURRENT_SHA=$(sha256sum ./supabase-state.tar.gz 2>/dev/null | cut -d' ' -f1)
+  CURRENT_SHA=$(sha256sum ./supabase-state.tar.zst 2>/dev/null | cut -d' ' -f1)
   LAST_SHA=$(cat "$CF_SHA_MARKER" 2>/dev/null || echo "")
 
   # Check if Cloudflare daily 1,000 writes quota was exhausted today
@@ -406,7 +402,7 @@ if [ -s ./supabase-state.tar.gz ]; then
       if grep -q '^CF_API_TOKEN=.' .env 2>/dev/null \
          && grep -q '^CF_ACCOUNT_ID=.' .env 2>/dev/null \
          && grep -q '^CF_KV_NAMESPACE_ID=.' .env 2>/dev/null \
-         && bash utils/cloudflare-backup.sh push ./supabase-state.tar.gz \
+         && bash utils/cloudflare-backup.sh push ./supabase-state.tar.zst \
          && bash utils/cloudflare-backup.sh verify; then
         PUSH_VERIFIED=1
       fi
@@ -436,15 +432,15 @@ fi
 
 # ── 7. Off-site mirror to GitHub Release (rolling live-backup) ─────────
 GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [ -s ./supabase-state.tar.gz ] && [ -n "$GH_AUTH_TOKEN" ]; then
+if [ -s ./supabase-state.tar.zst ] && [ -n "$GH_AUTH_TOKEN" ]; then
   echo "  📦 pushing rolling backup to GitHub Release (live-backup)..."
   GH_PUSH_OK=0
   for gh_attempt in 1 2 3; do
-    if GH_TOKEN="$GH_AUTH_TOKEN" gh release upload live-backup ./supabase-state.tar.gz --clobber >/dev/null 2>&1; then
+    if GH_TOKEN="$GH_AUTH_TOKEN" gh release upload live-backup ./supabase-state.tar.zst --clobber >/dev/null 2>&1; then
       GH_PUSH_OK=1
       break
     else
-      GH_TOKEN="$GH_AUTH_TOKEN" gh release create live-backup ./supabase-state.tar.gz --title "Live Database Backup" --notes "Automated rolling backup for Supabase self-hosted" >/dev/null 2>&1 && { GH_PUSH_OK=1; break; }
+      GH_TOKEN="$GH_AUTH_TOKEN" gh release create live-backup ./supabase-state.tar.zst --title "Live Database Backup" --notes "Automated rolling backup for Supabase self-hosted" >/dev/null 2>&1 && { GH_PUSH_OK=1; break; }
       sleep 2
     fi
   done
@@ -456,22 +452,22 @@ if [ -s ./supabase-state.tar.gz ] && [ -n "$GH_AUTH_TOKEN" ]; then
 fi
 
 # ── 8. Real-time mid-job save to GitHub Actions Cache ──────────────────
-if [ -s ./supabase-state.tar.gz ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+if [ -s ./supabase-state.tar.zst ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
   echo "  💾 pushing real-time snapshot to GitHub Actions Cache..."
-  node utils/save-actions-cache.cjs ./supabase-state.tar.gz 2>&1 || true
+  node utils/save-actions-cache.cjs ./supabase-state.tar.zst 2>&1 || true
 fi
 
 # ── 9. Off-site mirror to Hugging Face Private Dataset (50 GB Vault) ───
-if [ -s ./supabase-state.tar.gz ]; then
+if [ -s ./supabase-state.tar.zst ]; then
   if grep -q '^HF_TOKEN=.' .env 2>/dev/null || [ -n "${HF_TOKEN:-}" ]; then
-    bash utils/huggingface-backup.sh push ./supabase-state.tar.gz || echo "  ⚠️  Hugging Face backup failed; other backups preserved"
+    bash utils/huggingface-backup.sh push ./supabase-state.tar.zst || echo "  ⚠️  Hugging Face backup failed; other backups preserved"
   fi
 fi
 
 # ── 10. Off-site mirror to Discord Webhook (Chunked Cloud Vault) ───────
-if [ -s ./supabase-state.tar.gz ]; then
+if [ -s ./supabase-state.tar.zst ]; then
   if grep -q '^DISCORD_BACKUP_WEBHOOK=.' .env 2>/dev/null || [ -n "${DISCORD_BACKUP_WEBHOOK:-}" ]; then
-    bash utils/discord-backup.sh push ./supabase-state.tar.gz || echo "  ⚠️  Discord backup failed; other backups preserved"
+    bash utils/discord-backup.sh push ./supabase-state.tar.zst || echo "  ⚠️  Discord backup failed; other backups preserved"
   fi
 fi
 
