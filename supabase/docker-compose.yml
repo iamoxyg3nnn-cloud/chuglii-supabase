@@ -428,6 +428,12 @@ services:
       - ./volumes/db/init/data.sql:/docker-entrypoint-initdb.d/init-scripts/zz-init-data.sql:Z
       # PGDATA directory is persisted between restarts
       - ./volumes/db/data:/var/lib/postgresql/data:Z
+      # Workspace bind mount: pg_dump writes directory-format dumps straight to
+      # runner disk and pg_restore reads them back with ZERO docker cp — the
+      # docker-API copy of a ~600MB dump cost ~55s EACH WAY per cycle
+      # (snapshot cp-back + restore cp-in). The container only touches
+      # db-backups* subdirs, never secrets it doesn't already have.
+      - .:/mnt/host:Z
       # Changes required for internal supabase data such as _analytics
       - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:Z
       # Changes required for Analytics support

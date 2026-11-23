@@ -29,6 +29,9 @@ if ! docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
 fi
 
 DB_STAGING="$(mktemp -d ./db-backups.new.XXXXXX)"
+# World-writable: pg_dump runs as the container's postgres user and writes
+# into this dir through the /mnt/host bind mount.
+chmod 777 "$DB_STAGING"
 if ! DB_LIST=$(docker compose exec -T db psql -U postgres -d postgres -At -F '|' -c \
   "SELECT replace(encode(convert_to(datname, 'UTF8'), 'base64'), chr(10), '') || '|' || replace(encode(convert_to(pg_get_userbyid(datdba), 'UTF8'), 'base64'), chr(10), '') FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname"); then
   echo "  ERROR: could not enumerate PostgreSQL databases; keeping the previous archive" >&2
@@ -64,18 +67,17 @@ for DB_ENTRY in "${DB_ENTRIES[@]}"; do
   fi
   DB_DUMP_NAME="$(printf 'db-%08d.d' "$DB_INDEX")"
   echo "  🗄️  dumping database: $DB_NAME"
-  # The restore phase stages dumps at the same /tmp paths inside the container;
-  # a leftover directory makes pg_dump -f fail with "File exists" and KILLS
-  # every snapshot for the rest of the session (data-loss risk). Clean first.
-  docker compose exec -T db rm -rf "/tmp/$DB_DUMP_NAME" </dev/null 2>/dev/null || true
+  # Dump straight onto runner disk through the /mnt/host bind mount — no
+  # docker cp back (that copy cost ~55s per snapshot on a 600MB dump). The
+  # staging dir lives under the workspace, so the container sees it at
+  # /mnt/host/<basename>; atomic publish via mv below is unchanged.
+  STAGING_IN_CONTAINER="/mnt/host/$(basename "$DB_STAGING")"
   # Directory format + --jobs=4: the only pg_dump format that can dump in
   # parallel (custom format is single-threaded). --compress=0: the outer zstd
   # tar compresses once — double compression was ~3x slower for no real gain.
   if ! docker compose exec -T db pg_dump -U postgres --format=directory --jobs=4 --compress=0 --create \
-       --dbname="$DB_NAME" -f "/tmp/$DB_DUMP_NAME" </dev/null \
-       || ! docker compose exec -T db pg_restore --list "/tmp/$DB_DUMP_NAME" </dev/null >/dev/null \
-       || ! docker compose cp "db:/tmp/$DB_DUMP_NAME" "$DB_STAGING/$DB_DUMP_NAME" </dev/null \
-       || ! docker compose exec -T db rm -rf "/tmp/$DB_DUMP_NAME" </dev/null \
+       --dbname="$DB_NAME" -f "$STAGING_IN_CONTAINER/$DB_DUMP_NAME" </dev/null \
+       || ! docker compose exec -T db pg_restore --list "$STAGING_IN_CONTAINER/$DB_DUMP_NAME" </dev/null >/dev/null \
        || [ ! -d "$DB_STAGING/$DB_DUMP_NAME" ]; then
     echo "  ERROR: failed to dump database: $DB_NAME" >&2
     rm -rf "$DB_STAGING"

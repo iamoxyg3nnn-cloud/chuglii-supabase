@@ -74,4 +74,5 @@ print("\n".join(str(c["id"]) for c in entries[keep:]))' 2>/dev/null || true)
 }
 
 prune "supabase-db-" "$KEEP"
+prune "supabase-pgdata-" 2
 prune "docker-images-" "$DOCKER_KEEP"
