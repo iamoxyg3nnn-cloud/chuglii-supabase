@@ -848,7 +848,9 @@ jobs:
           PGDATA_OK=0
           if [ -s ./supabase-pgdata.tar.zst ]; then
             echo "PGDATA snapshot found — attempting fast-path restore..."
-            rm -rf ./volumes/db/data
+            # sudo: a previous fast-path attempt (or the extraction below) may
+            # have left root/uid-999-owned files that a plain rm cannot delete.
+            sudo rm -rf ./volumes/db/data
             if sudo tar -I 'zstd -T0 -3' -xf ./supabase-pgdata.tar.zst -C . 2>/dev/null \
                && [ -f ./volumes/db/data/PG_VERSION ]; then
               # The db-config volume (postgres custom config + pgsodium key)
@@ -879,7 +881,10 @@ jobs:
             if [ "$PGDATA_OK" -ne 1 ]; then
               echo "  ↩️  falling back to the dump-based restore"
               docker compose rm -sf db >/dev/null 2>&1 || true
-              rm -rf ./volumes/db/data ./db-config-snapshot
+              # sudo: the extracted datadir is uid-999/root-owned; a plain rm
+              # would fail and leave a dirty datadir that breaks the fresh
+              # initdb on the fallback path.
+              sudo rm -rf ./volumes/db/data ./db-config-snapshot
             fi
           fi
 
@@ -1859,8 +1864,16 @@ jobs:
               echo "::warning::Postgres did not stop cleanly; skipping PGDATA snapshot"
             else
               rm -f ./supabase-pgdata.tar.zst.new ./supabase-pgdata.tar.zst
-              if tar --warning=no-file-changed --use-compress-program='zstd -T0 -3' \
+              # sudo tar: the datadir files are owned by the container's
+              # postgres user (uid 999, mode 0600/0700) — a plain runner-side
+              # tar gets "Permission denied" on every file and the capture
+              # would silently never succeed (same bug class as the dump-dir
+              # chmod fix). sudo tar reads everything and preserves the
+              # recorded ownership, so the extracted datadir is directly
+              # usable by the db container on the next session.
+              if sudo tar --warning=no-file-changed --use-compress-program='zstd -T0 -3' \
                    -cf ./supabase-pgdata.tar.zst.new -C . volumes/db/data db-config-snapshot \
+                  && sudo chown "$(id -u):$(id -g)" ./supabase-pgdata.tar.zst.new \
                   && mv -f ./supabase-pgdata.tar.zst.new ./supabase-pgdata.tar.zst \
                   && [ -f ./volumes/db/data/PG_VERSION ]; then
                 echo "  ✅ PGDATA snapshot captured ($(du -h ./supabase-pgdata.tar.zst | cut -f1))"
