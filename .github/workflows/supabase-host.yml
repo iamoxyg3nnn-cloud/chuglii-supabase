@@ -475,18 +475,19 @@ jobs:
 
           extract_state_archive() {
             local archive="$1"
-            local members_file member
+            local members_file member perms og size fdate ftime
             members_file=$(mktemp)
-            if ! tar -tf "$archive" >/dev/null 2>&1; then
-              rm -f "$members_file"
-              return 1
-            fi
-            if tar -tvf "$archive" 2>/dev/null \
-              | awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { found = 1 } END { exit !found }'; then
-              rm -f "$members_file"
-              return 1
-            fi
-            while IFS= read -r member; do
+            # ONE listing pass (was 3 separate full decompression passes: a
+            # -tf validity probe, a -tvf type check, and a -tf member list).
+            # Validates readability, rejects non-regular/non-dir members, and
+            # builds the extraction list in a single sweep. GNU tar sniffs
+            # gzip and zstd automatically, so legacy archives still read.
+            while read -r perms og size fdate ftime member; do
+              [ -n "$member" ] || continue
+              case "${perms:0:1}" in
+                -|d) ;;
+                *) rm -f "$members_file"; return 1 ;;
+              esac
               case "$member" in
                 backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|postgresql.auto.conf|./postgresql.auto.conf|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|appendonlydir/appendonly.aof.manifest|./appendonlydir/appendonly.aof.manifest|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/inbucket/data|./volumes/inbucket/data|volumes/inbucket/data/|./volumes/inbucket/data/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|db-backups|./db-backups|db-backups/|./db-backups/|db-backups/globals.sql|./db-backups/globals.sql|db-backups/manifest.tsv|./db-backups/manifest.tsv|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d/|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].d/|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|.state-settings.env|./.state-settings.env|.cf-creds|./.cf-creds|state-ts|./state-ts)
                   case "$member" in
@@ -522,7 +523,7 @@ jobs:
                   fi
                   ;;
               esac
-            done < <(tar -tf "$archive" 2>/dev/null)
+            done < <(tar -tvf "$archive" 2>/dev/null)
             if [ ! -s "$members_file" ] || ! tar -xf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
               rm -f "$members_file"
               return 1
