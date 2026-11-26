@@ -89,6 +89,10 @@ BEGIN
     v_table := CASE v_site
         WHEN 'viral-mms'              THEN 'videos'
         WHEN 'mmsvibex'               THEN 'videos'
+        WHEN 'spicymms'               THEN 'spicymms_videos'
+        WHEN 'desi49'                 THEN 'desi49_videos'
+        WHEN 'mydesi'                 THEN 'mydesi_videos'
+        WHEN 'indianbfclips'          THEN 'indianbfclips_videos'
         WHEN 'japanese'               THEN 'japanese_videos'
         WHEN 'supjav'                 THEN 'japanese_videos'
         WHEN 'jav'                    THEN 'japanese_videos'
