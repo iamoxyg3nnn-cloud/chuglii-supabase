@@ -98,6 +98,7 @@ BEGIN
         WHEN 'jav'                    THEN 'japanese_videos'
         WHEN 'myanmar'                THEN 'myanmar_videos'
         WHEN 'buumal'                 THEN 'myanmar_videos'
+        WHEN 'samusar'                THEN 'samusar_videos'
         WHEN 'influencersgonewild'    THEN 'onlyfans_videos'
         WHEN 'sheeshfans'             THEN 'onlyfans_videos'
         WHEN 'voyeurhouseorg'         THEN 'voyeurhouse_videos'
