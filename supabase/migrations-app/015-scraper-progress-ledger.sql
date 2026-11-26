@@ -94,7 +94,6 @@ BEGIN
         WHEN 'jav'                    THEN 'japanese_videos'
         WHEN 'myanmar'                THEN 'myanmar_videos'
         WHEN 'buumal'                 THEN 'myanmar_videos'
-        WHEN 'internetchicks'         THEN 'onlyfans_videos'
         WHEN 'influencersgonewild'    THEN 'onlyfans_videos'
         WHEN 'sheeshfans'             THEN 'onlyfans_videos'
         WHEN 'voyeurhouseorg'         THEN 'voyeurhouse_videos'
@@ -106,7 +105,7 @@ BEGIN
     END;
 
     IF v_table IS NOT NULL AND to_regclass('scraper.' || v_table) IS NOT NULL THEN
-        IF v_site IN ('internetchicks', 'influencersgonewild', 'sheeshfans') THEN
+        IF v_site IN ('influencersgonewild', 'sheeshfans') THEN
             v_filter := format('AND source_site = %L', v_site);
         END IF;
         EXECUTE format(

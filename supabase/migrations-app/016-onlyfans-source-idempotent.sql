@@ -16,7 +16,7 @@ DECLARE
     table_key text;
     inserted_count integer;
 BEGIN
-    IF p_site NOT IN ('internetchicks', 'influencersgonewild', 'sheeshfans') THEN
+    IF p_site NOT IN ('influencersgonewild', 'sheeshfans') THEN
         RAISE EXCEPTION 'Unknown OnlyFans source: %', p_site;
     END IF;
     table_key := p_site || '_videos';
